@@ -1,0 +1,18 @@
+# 本地私密配置
+secrets.local.json
+partner_profile.local.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.env
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store

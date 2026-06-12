@@ -1,0 +1,5 @@
+discord.py
+openai
+psycopg[binary]
+psycopg-pool
+aiohttp
