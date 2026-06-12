@@ -1,7 +1,5 @@
 """Postgres 连接池 + 兼容旧调用风格的 db_acquire()。
 
-旧代码到处是 `conn = await psycopg.AsyncConnection.connect(URL); ...; await conn.close()`。
-为了避免大改缩进，db_acquire() 返回一个对象，await close() 等价于把连接归还池子。
 """
 import contextlib
 import psycopg
@@ -10,9 +8,7 @@ from psycopg_pool import AsyncConnectionPool
 import config  # config 无内部依赖，可安全 import，不会形成环。
 
 # 可由 configure() 覆盖；为空时回落到 config.DATABASE_URL。
-# 注意：历史上这里曾依赖 bot.py 调 configure() 注入，但该调用一直缺失，
-# 导致 DATABASE_URL 恒为空 → 连接池不创建 → db_acquire() 用空串拨号，
-# 退化成连本地 /var/run/postgresql 的 socket 而报错。改为默认读 config。
+
 DATABASE_URL: str = ""
 
 db_pool: "AsyncConnectionPool | None" = None

@@ -95,6 +95,9 @@ cd <你的私库>
 - `QUIET_CHANNEL_IDS`：T.S. 在这些频道里非常少发言。
 - `SILENT_CHANNEL_IDS`：T.S. 在这些频道里完全不发言、不监听 reaction。
 - `DAILY_TOKEN_BUDGET`：每天最多花多少 token（0 = 无限制）。建议设一个数字保命。
+- `DATABASE_URL`：Postgres 连接串，启用长期记忆等持久化功能。免费数据库怎么领见下方「数据库」一节。
+
+每个字段更详细的解释，`secrets.example.json` 里以 `_` 开头的注释键都写明白了，照着填即可。
 
 `secrets.local.json` 已经在 `.gitignore` 里，**不会被推到 GitHub**。
 
@@ -177,7 +180,7 @@ partner_profile.example.md
 
 ## 数据库
 
-可选。配了 `DATABASE_URL`（Postgres）会启用：
+可选，但**强烈建议配**。配了 `DATABASE_URL`（Postgres）会启用：
 
 - 长期记忆（`user_notes` 表，T.S. 会自动从你的话里提取值得记的事）
 - 每日对话摘要（`daily_summaries` 表）
@@ -186,7 +189,30 @@ partner_profile.example.md
 - 金币/经验系统（`users` 表）
 - bot 配置持久化（`bot_config` 表）
 
-不配也能跑，所有数据都退化到内存——重启就丢。
+不配也能跑,但所有数据都存在内存里——**bot 一重启（托管平台随时可能重启你的服务）记忆、提醒、金币全部清零**。也就是说不配数据库的 T.S. 是「失忆体质」。
+
+### 免费 Postgres 去哪领
+
+任选一家,都有免费档,流程都是「注册 → 建一个数据库 → 复制连接串」:
+
+| 平台 | 适合谁 | 备注 |
+|---|---|---|
+| **[Neon](https://neon.tech)** | 大多数人,**推荐** | 免费档 0.5GB,够 T.S. 记很多年。注册后建 Project,首页直接给你 `postgresql://...` 连接串,复制即用 |
+| **[Supabase](https://supabase.com)** | 也很省心 | 免费档 0.5GB。建 Project 后到 **Settings → Database → Connection string**,选 URI 格式复制（记得把 `[YOUR-PASSWORD]` 换成你建库时设的密码） |
+| **[Railway](https://railway.app)** | 已经用 Railway 托管 bot 的人 | 在同一个项目里 **New → Database → PostgreSQL**,然后在 bot 服务的 Variables 里引用 `${{Postgres.DATABASE_URL}}` 即可,内网直连最快。注意 Railway 免费额度有限,数据库和 bot 一起跑可能要付一点钱 |
+
+### 拿到连接串之后
+
+连接串长这样：`postgresql://用户名:密码@主机:5432/数据库名`
+
+填到哪都行（任选其一）：
+
+- **托管平台部署**：加一个环境变量,名字 `DATABASE_URL`,值就是连接串。（推荐）
+- **本地试跑**：填进 `secrets.local.json` 的 `DATABASE_URL` 字段。
+
+⚠️ 连接串里含密码,和 token 一样属于机密,不要发给任何人、不要提交到 GitHub。
+
+建表不用你操心：bot 第一次启动时会自动把需要的表全部建好。
 
 ---
 

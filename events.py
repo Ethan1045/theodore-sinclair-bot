@@ -18,6 +18,7 @@ from memory import (
     ensure_daily_summaries_table,
     ensure_bot_config_table,
     ensure_reminders_table,
+    ensure_users_table,
     load_persisted_config,
     extract_and_save_memory,
 )
@@ -94,6 +95,7 @@ async def on_ready():
     await ensure_daily_summaries_table()
     await ensure_bot_config_table()
     await ensure_reminders_table()
+    await ensure_users_table()
     await ensure_conversation_history_table()
     await load_persisted_config()
     await load_all_histories()

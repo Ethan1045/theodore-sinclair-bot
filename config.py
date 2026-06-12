@@ -105,7 +105,7 @@ MODEL_NAME = (
     or str(_secrets.get("MODEL_NAME", "")).strip()
     or "gpt-4o"
 )
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DATABASE_URL = (os.getenv("DATABASE_URL", "").strip() or str(_secrets.get("DATABASE_URL", "")).strip())
 
 DAILY_TOKEN_BUDGET = int(os.getenv("DAILY_TOKEN_BUDGET", str(_secrets.get("DAILY_TOKEN_BUDGET", "0"))) or "0")
 

@@ -14,7 +14,7 @@ _CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
             "胃", "牙", "嗓子", "头晕", "经期", "例假"),
     "偏好": ("喜欢", "讨厌", "爱吃", "不吃", "最爱", "最讨厌", "偏好", "口味", "好喝", "好吃", "难吃"),
     "关系": ("妈妈", "爸爸", "妈", "爸", "姐", "弟", "妹", "朋友", "同学", "猫", "狗",
-            "宠物", "男朋友", "前任"),
+            "宠物"),
     "计划": ("打算", "准备", "想去", "下周", "下个月", "明天", "考试", "旅行", "出差",
             "约", "deadline", "ddl", "面试"),
     "情绪": ("开心", "难过", "焦虑", "压力", "烦", "委屈", "生气", "兴奋", "失落",
@@ -124,6 +124,29 @@ async def ensure_bot_config_table():
         print("✅ bot_config 表已就绪")
     except Exception as e:
         print(f"⚠️ bot_config 表初始化失败: {e}")
+
+
+async def ensure_users_table():
+    if not config.DATABASE_URL:
+        return
+    try:
+        async with _db.db_conn() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        guild_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        balance BIGINT NOT NULL DEFAULT 0,
+                        bank BIGINT NOT NULL DEFAULT 0,
+                        xp BIGINT NOT NULL DEFAULT 0,
+                        level INT NOT NULL DEFAULT 1,
+                        PRIMARY KEY (guild_id, user_id)
+                    )
+                """)
+                await conn.commit()
+        print("✅ users 表已就绪")
+    except Exception as e:
+        print(f"⚠️ users 表初始化失败: {e}")
 
 
 # ==== bot_config 持久化 ====
