@@ -126,6 +126,29 @@ async def ensure_bot_config_table():
         print(f"⚠️ bot_config 表初始化失败: {e}")
 
 
+async def ensure_users_table():
+    if not config.DATABASE_URL:
+        return
+    try:
+        async with _db.db_conn() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        guild_id TEXT NOT NULL,
+                        user_id TEXT NOT NULL,
+                        balance BIGINT NOT NULL DEFAULT 0,
+                        bank BIGINT NOT NULL DEFAULT 0,
+                        xp BIGINT NOT NULL DEFAULT 0,
+                        level INT NOT NULL DEFAULT 1,
+                        PRIMARY KEY (guild_id, user_id)
+                    )
+                """)
+                await conn.commit()
+        print("✅ users 表已就绪")
+    except Exception as e:
+        print(f"⚠️ users 表初始化失败: {e}")
+
+
 # ==== bot_config 持久化 ====
 
 _PERSISTED_CONFIG_KEYS: dict[str, type] = {
