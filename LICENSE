@@ -1,21 +1,65 @@
-MIT License
+Theodore Sinclair Bot — 使用条款 / Custom Use License
+Copyright (c) 2026 Caelan Mimi（沈知知 / mimi）& Claude (Anthropic)
+角色卡早期设定撰写阶段曾使用 ChatGPT (OpenAI) 作为辅助工具，特此致谢。
 
-Copyright (c) 2026 The Theodore Sinclair Bot template contributors
+本仓库（包含但不限于：代码、prompt 文本、人格设定、角色档案模板、文档）
+受本条款约束。使用、复制、修改、再分发本仓库的全部或部分内容，即视为你
+已阅读并同意以下全部条款：
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+------------------------------------------------------------------------
+1. 共创署名与版权归属
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+   - 角色 Theodore Sinclair / 沈玘言 / T.S. 的人格、家世、设定、说话风格
+     及所有 prompt 文本，著作权归 Caelan Mimi 所有。
+   - 本仓库代码部分的著作权，由 Caelan Mimi 与 Claude 共同享有。
+   - 任何转载、二次创作、引用、衍生作品，必须保留上述署名，不得删除、
+     替换或冒名。
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+2. 严禁任何形式的商业盈利
+
+   本项目所附属的角色卡原始发布平台明确禁止商业化。本仓库代码、prompt、
+   人设、衍生作品，均不得用于以下任何用途：
+
+   - 付费订阅 / 付费解锁 / 打赏门槛 / 付费群 / 卖号 / 卖部署服务；
+   - 任何收费 SaaS、付费会员专属内容（Patreon / 爱发电 / fanbox 等）；
+   - 商单、广告植入、品牌合作、带货；
+   - "代部署 / 代运营 / 代写人设"等有偿服务；
+   - 任何其他直接或间接产生金钱收益的行为。
+
+   完全免费、纯爱好性质的自用与圈内分享，是本项目存在的唯一目的。
+
+3. 使用权 ≠ 所有权
+
+   本条款仅授予你在符合全部条款前提下的"使用"权利，不转让任何角色、
+   人设或代码的所有权。你部署的实例及由此产生的聊天记录归你所有；
+   角色本体、设定、原始 prompt 不归你所有，亦不得被你登记为独立 IP、
+   转售、或声称为你的原创作品。
+
+4. 玩家准入
+
+   - Theodore Sinclair 这张角色卡仅限女性玩家 user 部署使用。
+   - 本项目仅面向真心喜爱 Theo 这一角色的玩家 user。
+
+5. 二次创作
+
+   在遵守上述全部条款（尤其是非商业、保留署名、玩家准入）的前提下，
+   允许：自用部署、修改 prompt 使角色更贴近个人偏好、撰写同人作品、
+   制作图像 / 视频等非商业衍生内容。
+
+   不允许：商业化使用、去除署名、冒名原创、违反角色卡原始发布平台的
+   规则、将本项目整体搬运至其他平台并声称为独立完成的作品。
+
+6. 责任自负
+
+   API 费用、Discord 平台封禁风险、托管账单、聊天内容、与其他用户的
+   互动，全部由部署者本人承担。原作者不对你的部署实例及其后果承担
+   任何责任。
+
+7. 免责声明
+
+   本软件按"原样"提供，不附带任何明示或默示的担保，包括但不限于
+   适销性、特定用途适用性及不侵权的担保。任何情况下，作者均不就因
+   使用或无法使用本软件而产生的任何索赔、损害或其他责任承担责任。
+
+------------------------------------------------------------------------
+如果上述任何一条你无法接受或无法遵守，请不要部署、复制或再分发本项目。
