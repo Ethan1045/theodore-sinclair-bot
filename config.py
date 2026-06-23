@@ -114,6 +114,9 @@ PROACTIVE_CHANNEL_ID = int(os.getenv("PROACTIVE_CHANNEL_ID", str(_secrets.get("P
 PARTNER_HOME_CHANNEL_ID = int(os.getenv("PARTNER_HOME_CHANNEL_ID", str(_secrets.get("PARTNER_HOME_CHANNEL_ID", "0"))) or "0")
 QUIET_CHANNEL_IDS: set[int] = _read_id_set("QUIET_CHANNEL_IDS")
 SILENT_CHANNEL_IDS: set[int] = _read_id_set("SILENT_CHANNEL_IDS")
+# 「仅触发回复」频道：只在被 @、被引用、或正文里出现专属称呼/关键词时才回，
+# 不做任何随机插话（连她的日常闲聊也不主动接）。可用 env/secret 追加更多频道。
+MENTION_ONLY_CHANNEL_IDS: set[int] = _read_id_set("MENTION_ONLY_CHANNEL_IDS") | {1500026788170960976}
 
 # ==== 用户 ID ====
 PARTNER_USER_ID = _read_int_id("PARTNER_USER_ID")

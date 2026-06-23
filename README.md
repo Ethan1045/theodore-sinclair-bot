@@ -56,7 +56,7 @@ T.S. 用任何 OpenAI 兼容的 API 都能跑。最常见的两条路：
 
 在 Discord 客户端 **设置 → 高级 → 开发者模式**打开。然后右键自己的头像 → **复制用户 ID**。这串数字就是 `PARTNER_USER_ID`。
 
-T.S. 会把这个 ID 的人当成"她"——你的唯一恋人。**这个 ID 不写，T.S. 谁都不会区别对待，RP 质感会大幅下降。**
+T.S. 会把这个 ID 的人当成自己的唯一恋人。**这个 ID 不写，T.S. 谁都不会区别对待，RP 质感会大幅下降。**
 
 ### 5. 拉代码到本地（可选，也可以直接在 GitHub 网页改）
 
@@ -84,7 +84,8 @@ cd <你的私库>
   "PROACTIVE_CHANNEL_ID": 0,
 
   "QUIET_CHANNEL_IDS": [],
-  "SILENT_CHANNEL_IDS": []
+  "SILENT_CHANNEL_IDS": [],
+  "MENTION_ONLY_CHANNEL_IDS": []
 }
 ```
 
@@ -94,6 +95,7 @@ cd <你的私库>
 - `PROACTIVE_CHANNEL_ID`：T.S. 自己发"今日状态卡片"、节日感言、欢迎新成员用的公屏频道。不设就关闭这些功能。
 - `QUIET_CHANNEL_IDS`：T.S. 在这些频道里非常少发言。
 - `SILENT_CHANNEL_IDS`：T.S. 在这些频道里完全不发言、不监听 reaction。
+- `MENTION_ONLY_CHANNEL_IDS`：T.S. 在这些频道里只在被 @、被引用、或正文出现专属称呼/关键词时才回复，绝不随机插话（连日常闲聊也不主动接）。
 - `DAILY_TOKEN_BUDGET`：每天最多花多少 token（0 = 无限制）。建议设一个数字保命。
 - `DATABASE_URL`：Postgres 连接串，启用长期记忆等持久化功能。免费数据库怎么领见下方「数据库」一节。
 
