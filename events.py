@@ -193,6 +193,15 @@ async def on_message(message):
             return
         state.user_cooldowns[message.author.id] = now_dt
 
+    # 「仅触发回复」频道：没有被 @、没引用到他、正文里也没出现专属称呼/关键词时，
+    # 一律不回（包括她的日常闲聊），彻底关掉随机插话。
+    in_mention_only_channel = (
+        not is_dm
+        and getattr(message.channel, "id", None) in config.MENTION_ONLY_CHANNEL_IDS
+    )
+    if in_mention_only_channel and not (is_mentioned or is_quoting_bot or is_named):
+        return
+
     should_send_to_brain = False
     in_quiet_channel = (
         not is_dm

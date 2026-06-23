@@ -84,7 +84,8 @@ cd <你的私库>
   "PROACTIVE_CHANNEL_ID": 0,
 
   "QUIET_CHANNEL_IDS": [],
-  "SILENT_CHANNEL_IDS": []
+  "SILENT_CHANNEL_IDS": [],
+  "MENTION_ONLY_CHANNEL_IDS": []
 }
 ```
 
@@ -94,6 +95,7 @@ cd <你的私库>
 - `PROACTIVE_CHANNEL_ID`：T.S. 自己发"今日状态卡片"、节日感言、欢迎新成员用的公屏频道。不设就关闭这些功能。
 - `QUIET_CHANNEL_IDS`：T.S. 在这些频道里非常少发言。
 - `SILENT_CHANNEL_IDS`：T.S. 在这些频道里完全不发言、不监听 reaction。
+- `MENTION_ONLY_CHANNEL_IDS`：T.S. 在这些频道里只在被 @、被引用、或正文出现专属称呼/关键词时才回复，绝不随机插话（连日常闲聊也不主动接）。
 - `DAILY_TOKEN_BUDGET`：每天最多花多少 token（0 = 无限制）。建议设一个数字保命。
 - `DATABASE_URL`：Postgres 连接串，启用长期记忆等持久化功能。免费数据库怎么领见下方「数据库」一节。
 
