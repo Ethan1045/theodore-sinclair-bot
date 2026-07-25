@@ -5,7 +5,7 @@ from urllib.parse import quote_plus
 
 _COT_OPENERS = (
     "let's", "let me", "i'll ", "i will ", "my response", "my reply",
-    "the user", "user's message", "this is a",
+    "the user", "partner's message", "partner is", "this is a",
     "i should", "i need to", "i want to", "first,", "step 1",
     "okay,", "alright,", "options:", "plan:", "thinking:",
     "draft:", "considering", "analysis:", "breakdown:",
@@ -109,11 +109,14 @@ def parse_bot_directives(raw_bot_reply: str):
     - action_matches: [ACTION]...[/ACTION] 的 JSON 字符串列表
     """
     # 强力清除思维链与裸 CoT 段落
+    original = raw_bot_reply
     raw_bot_reply = _strip_cot_preamble(raw_bot_reply)
+    if not raw_bot_reply.strip():
+        raw_bot_reply = original
 
     reaction_match = re.search(r'\[REACTION:(.*?)\]', raw_bot_reply, re.DOTALL)
     emojis_to_react = []
-    reaction_target = "SELF"
+    reaction_target = "USER"
     if reaction_match:
         raw_emojis = reaction_match.group(1).strip()
         if raw_emojis.upper() != "NONE":
@@ -165,7 +168,7 @@ def _resolve_link_directive(kind: str, query: str) -> str | None:
     qenc = quote_plus(q)
     k = (kind or "").strip().lower()
     if k in ("music", "song", "spotify"):
-        return f"https://open.spotify.com/search/{qenc}"
+        return f"https://song.link/s/{qenc}"
     if k in ("youtube", "yt", "mv"):
         return f"https://www.youtube.com/results?search_query={qenc}"
     if k in ("book", "books"):

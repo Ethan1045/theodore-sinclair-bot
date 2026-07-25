@@ -4,7 +4,7 @@ import json
 import random
 import re
 import traceback as _tb
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
 
 import discord
@@ -24,7 +24,7 @@ from directives import parse_bot_directives
 from presence import generate_presence, generate_custom_bubble, _TYPE_MAP
 
 # ==== 可通过 /post_config 实时修改的参数 ====
-DAILY_CARD_PROB_NORMAL = 0.22
+DAILY_CARD_PROB_NORMAL = 0.35
 DAILY_CARD_PROB_OCCASION = 0.85
 STALE_POST_AGE_DAYS = 7
 STALE_POST_MAX_REPLIES = 0
@@ -94,6 +94,36 @@ def parse_reminder_from_text(text: str) -> tuple[timedelta | None, str]:
     return None, ""
 
 
+def _extract_json_object(text: str) -> dict | None:
+    """从可能包含多余文本的 AI 回复中提取第一个 JSON 对象。"""
+    if not text:
+        return None
+    cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned)
+    cleaned = re.sub(r'\s*```\s*$', '', cleaned).strip()
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError:
+        pass
+    depth = 0
+    start = -1
+    for i, ch in enumerate(cleaned):
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start >= 0:
+                try:
+                    return json.loads(cleaned[start:i + 1])
+                except json.JSONDecodeError:
+                    start = -1
+    return None
+
+
 async def generate_daily_card_data(weather: str | None = None) -> dict | None:
     from config import get_beijing_time_note, get_today_occasion
     time_ctx = get_beijing_time_note()
@@ -114,55 +144,75 @@ async def generate_daily_card_data(weather: str | None = None) -> dict | None:
         "note: 今日一句话碎念/感受（不超过50字，双语）\n"
         "weather: 一句对天气的感受（不超过30字，双语）\n"
         "footer: 极短落款（不超过24字）\n\n"
-        "【禁止】不要直接提到她（你的恋人）；不要用励志/鸡汤语气；不要编造不存在的书名\n\n"
-        "输出格式：严格只输出一个JSON对象，不加任何说明或代码块标记。\n\n"
+        "【禁止】不要提到恋人；不要用励志/鸡汤语气；不要编造不存在的书名\n\n"
+        "输出格式：严格只输出一个JSON对象，不加任何说明或代码块标记。\n"
+        '示例：{"location":"...","reading":"...","listening":"...","note":"...","weather":"...","footer":"..."}\n\n'
         "现在输出："
     )
 
-    try:
-        response = await ai_chat_create(
-            model=config.MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024,
-            temperature=0.95,
-        )
-        raw = response.choices[0].message.content.strip()
-        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
-        raw = re.sub(r'^```(?:json)?\s*', '', raw)
-        raw = re.sub(r'\s*```$', '', raw).strip()
-        return json.loads(raw)
-    except Exception as e:
-        print(f"⚠️ 生成今日卡片数据失败: {e}")
-        return None
+    messages = [
+        {"role": "system", "content": "你是一个JSON生成助手。用户会描述需要的字段，你只输出一个合法的JSON对象，不加任何多余文字。"},
+        {"role": "user", "content": prompt},
+    ]
+
+    for attempt in range(2):
+        try:
+            response = await ai_chat_create(
+                model=config.MODEL_NAME,
+                messages=messages,
+                max_tokens=8192,
+                temperature=0.7,
+            )
+            msg = response.choices[0].message if response.choices else None
+            if not msg:
+                print(f"⚠️ 生成今日卡片数据: API 无 choices (attempt {attempt + 1}/2)")
+                continue
+            raw = (msg.content or "").strip()
+            if not raw:
+                extra = ""
+                for attr in ("reasoning_content", "reasoning", "refusal"):
+                    val = getattr(msg, attr, None)
+                    if val:
+                        extra += f" {attr}={str(val)[:150]}"
+                print(f"⚠️ 生成今日卡片数据: content为空 (attempt {attempt + 1}/2)"
+                      f" finish_reason={response.choices[0].finish_reason}{extra}")
+                continue
+            data = _extract_json_object(raw)
+            if data:
+                return data
+            print(f"⚠️ 生成今日卡片数据: JSON 解析失败 (attempt {attempt + 1}/2)，原始: {raw[:300]!r}")
+        except Exception as e:
+            print(f"⚠️ 生成今日卡片数据失败 (attempt {attempt + 1}/2): {e}")
+        if attempt == 0:
+            await asyncio.sleep(3)
+    return None
 
 
 # ==== @tasks.loop 后台任务 ====
 
-@tasks.loop(hours=4)
+@tasks.loop(hours=8)
 async def proactive_dm_partner():
-    """主动给她发私信。需要 config.PARTNER_USER_ID。"""
     await discord_client.wait_until_ready()
-    if not config.PARTNER_USER_ID:
-        return
     if state.last_partner_activity_at is not None:
         from datetime import timezone
         idle = (datetime.now(timezone.utc) - state.last_partner_activity_at).total_seconds()
-        if idle < 30 * 60:
+        if idle < 90 * 60:
             return
-    if random.random() > 0.35:
+    if random.random() > 0.15:
         return
 
     now_bj = datetime.now(ZoneInfo("Asia/Shanghai"))
     hour = now_bj.hour
 
     if 2 <= hour < 8:
-        if random.random() > 0.08:
+        if random.random() > 0.03:
             return
         is_late_night = True
     else:
         is_late_night = False
 
     try:
+        from datetime import timezone
         from ai_client import call_ai
         partner = await discord_client.fetch_user(config.PARTNER_USER_ID)
         time_ctx = config.get_beijing_time_note()
@@ -175,7 +225,7 @@ async def proactive_dm_partner():
         )
         if is_late_night:
             prompt_content = (
-                f"（系统提示：{time_ctx} 现在是深夜。你还没睡，想到了她，给她发一条私信。"
+                f"（系统提示：{time_ctx} 现在是深夜。你还没睡，想到了恋人，给她发一条私信。"
                 "内容极短，语气比平时更轻，带一点深夜特有的安静感。"
                 f"绝对不要催她睡觉。{FORMAT_REMINDER}）"
             )
@@ -186,14 +236,14 @@ async def proactive_dm_partner():
 
             if recall_note:
                 prompt_content = (
-                    f"（系统提示：{time_ctx} 你主动给她发私信。"
+                    f"（系统提示：{time_ctx} 你主动给恋人发私信。"
                     f"你想到了她之前提过的一件事：「{recall_note}」。"
                     "请自然地以这件事为由头发一条消息。绝对不要说'我记得你说过'，"
                     f"直接当共同认知使用。私聊语气，简短。{FORMAT_REMINDER}）"
                 )
             else:
                 prompt_content = (
-                    f"（系统提示：{time_ctx} 你现在主动给她发了一条私信。"
+                    f"（系统提示：{time_ctx} 你现在主动给恋人发了一条私信。"
                     "内容要符合你的风格。可以是随口问她在干嘛、说一句你在做什么。"
                     f"私聊语气比群里柔软，但依然不要油腻。{FORMAT_REMINDER}）"
                 )
@@ -214,19 +264,18 @@ async def proactive_dm_partner():
         async with state.get_bucket_lock(dm_key):
             dm_hist.append({
                 "role": "assistant",
-                "content": f"（主动私信她）{clean.replace('[SPLIT]', chr(10))}"
+                "content": f"（主动私信恋人）{clean.replace('[SPLIT]', chr(10))}"
             })
         await trim_history(dm_key)
-        print(f"✅ 主动私信她发送成功（深夜模式: {is_late_night}）")
+        print(f"✅ 主动私信恋人发送成功（深夜模式: {is_late_night}）")
     except Exception as e:
-        print(f"主动私信她报错: {e}")
+        print(f"主动私信恋人报错: {e}")
 
 
 @tasks.loop(hours=1)
 async def anniversary_check():
-    """每天早上 9 点扫一遍记忆里有日期标记的条目，命中今天就给她发一条纪念日私信。"""
     await discord_client.wait_until_ready()
-    if not config.DATABASE_URL or not config.PARTNER_USER_ID:
+    if not config.DATABASE_URL:
         return
     now_bj = datetime.now(ZoneInfo("Asia/Shanghai"))
     if now_bj.hour != 9:
@@ -266,9 +315,9 @@ async def anniversary_check():
         )
         is_birthday = (cat == "日期" and "生日" in (note or ""))
         if is_birthday:
-            tone = "今天是她的生日。给她发一条私信，语气是你的风格：克制、不甜腻、但有心。"
+            tone = ("今天是恋人的生日。给她发一条私信，语气是你的风格：克制、不甜腻、但有心。")
         else:
-            tone = f"今天是这件事的纪念日/重要日子：「{note}」。给她发一条私信轻轻提一下，简短。"
+            tone = (f"今天是这件事的纪念日/重要日子：「{note}」。给恋人发一条私信轻轻提一下，简短。")
         prompt_content = f"（系统提示：{time_ctx} {tone} {FORMAT_REMINDER}）"
 
         dm_key = f"dm:{config.PARTNER_USER_ID}"
@@ -288,7 +337,7 @@ async def anniversary_check():
         async with state.get_bucket_lock(dm_key):
             dm_hist.append({
                 "role": "assistant",
-                "content": f"（纪念日私信：{note}）{clean.replace('[SPLIT]', chr(10))}"
+                "content": f"（纪念日私信恋人：{note}）{clean.replace('[SPLIT]', chr(10))}"
             })
         await trim_history(dm_key)
         print(f"✅ 纪念日触发成功：{note}")
@@ -296,58 +345,8 @@ async def anniversary_check():
         print(f"⚠️ 纪念日触发失败: {e}")
 
 
-@tasks.loop(minutes=10)
-async def cleanup_cooldowns():
-    await discord_client.wait_until_ready()
-    from datetime import timezone
-    now_dt = datetime.now(timezone.utc)
-    expired = [uid for uid, ts in state.user_cooldowns.items()
-               if (now_dt - ts).total_seconds() > config.COOLDOWN_SECONDS * 10]
-    for uid in expired:
-        state.user_cooldowns.pop(uid, None)
-    if expired:
-        print(f"🧹 清理过期冷却记录 {len(expired)} 条，当前剩余: {len(state.user_cooldowns)}")
-    if len(state._recent_presences) > 10:
-        state._recent_presences = state._recent_presences[-10:]
-
-
-@tasks.loop(hours=6)
-async def cleanup_idle_histories():
-    await discord_client.wait_until_ready()
-    from datetime import timezone
-    now_dt = datetime.now(timezone.utc)
-    threshold = config.HISTORY_IDLE_DAYS * 86400
-    drop_keys: list[str] = []
-    pinned_dm_key = f"dm:{config.PARTNER_USER_ID}" if config.PARTNER_USER_ID else None
-    for key in list(state._histories.keys()):
-        if key == config.SYSTEM_HISTORY_KEY:
-            continue
-        if pinned_dm_key and key == pinned_dm_key:
-            continue
-        last = state._bucket_touched.get(key)
-        if last is None:
-            state._bucket_touched[key] = now_dt
-            continue
-        if (now_dt - last).total_seconds() > threshold:
-            drop_keys.append(key)
-    for k in drop_keys:
-        state._histories.pop(k, None)
-        state._bucket_locks.pop(k, None)
-        state._bucket_touched.pop(k, None)
-        await delete_persisted_history(k)
-    if drop_keys:
-        print(f"🧹 闲置桶清理：丢弃 {len(drop_keys)} 个 (idle > {config.HISTORY_IDLE_DAYS} 天)，剩 {len(state._histories)} 个")
-
-
-@tasks.loop(seconds=30)
-async def persist_histories_task():
-    await discord_client.wait_until_ready()
-    await flush_dirty_histories()
-
-
-@tasks.loop(hours=3)
+@tasks.loop(hours=1)
 async def daily_summary_task():
-    """每天北京时间凌晨 3 点跑一次，总结昨天的聊天。"""
     global _daily_summary_done_for
     await discord_client.wait_until_ready()
     if not config.DATABASE_URL:
@@ -371,13 +370,14 @@ async def daily_summary_task():
                 if not txt:
                     continue
                 items.append(f"[{label}] {role}: {txt[:300]}")
-        if len(items) < 4:
+        if len(items) < 2:
             _daily_summary_done_for = target_date
+            print(f"📝 每日摘要跳过({target_date}): 对话条目不足（{len(items)} < 2）")
             return
 
         joined = "\n".join(items[-60:])
         prompt = (
-            "下面是 T.S. 和她过去一天的对话片段。请用一句中文（30-60字）总结：\n"
+            "下面是T.S.和恋人过去一天的对话片段。请用一句中文（30-60字）总结：\n"
             "- 聊到了什么核心话题或事件\n"
             "- 如果有情绪/状态变化，简单点出\n"
             "- 不要列项、不要换行、不要任何前缀\n\n"
@@ -385,8 +385,11 @@ async def daily_summary_task():
         )
         response = await ai_chat_create(
             model=config.MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
+            messages=[
+                {"role": "system", "content": "你是一个摘要助手。请用简洁的中文总结对话内容。"},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=4096,
             temperature=0.3,
         )
         summary = (response.choices[0].message.content or "").strip()
@@ -410,9 +413,58 @@ async def daily_summary_task():
         print(f"⚠️ 每日摘要生成失败: {e}")
 
 
+@tasks.loop(minutes=10)
+async def cleanup_cooldowns():
+    await discord_client.wait_until_ready()
+    from datetime import timezone
+    now_dt = datetime.now(timezone.utc)
+    expired = [uid for uid, ts in state.user_cooldowns.items()
+               if (now_dt - ts).total_seconds() > config.COOLDOWN_SECONDS * 10]
+    for uid in expired:
+        state.user_cooldowns.pop(uid, None)
+    if expired:
+        print(f"🧹 清理过期冷却记录 {len(expired)} 条，当前剩余: {len(state.user_cooldowns)}")
+    if len(state._recent_presences) > 10:
+        state._recent_presences = state._recent_presences[-10:]
+
+
+@tasks.loop(hours=6)
+async def cleanup_idle_histories():
+    await discord_client.wait_until_ready()
+    from datetime import timezone
+    now_dt = datetime.now(timezone.utc)
+    partner_dm_key = f"dm:{config.PARTNER_USER_ID}"
+    drop_keys: list[str] = []
+    for key in list(state._histories.keys()):
+        if key == config.SYSTEM_HISTORY_KEY:
+            continue
+        if key == partner_dm_key:
+            continue
+        is_friend_dm = key.startswith("dm:")
+        threshold = config.FRIEND_HISTORY_IDLE_DAYS * 86400 if is_friend_dm else config.HISTORY_IDLE_DAYS * 86400
+        last = state._bucket_touched.get(key)
+        if last is None:
+            state._bucket_touched[key] = now_dt
+            continue
+        if (now_dt - last).total_seconds() > threshold:
+            drop_keys.append(key)
+    for k in drop_keys:
+        state._histories.pop(k, None)
+        state._bucket_locks.pop(k, None)
+        state._bucket_touched.pop(k, None)
+        await delete_persisted_history(k)
+    if drop_keys:
+        print(f"🧹 闲置桶清理：丢弃 {len(drop_keys)} 个，剩 {len(state._histories)} 个")
+
+
+@tasks.loop(seconds=30)
+async def persist_histories_task():
+    await discord_client.wait_until_ready()
+    await flush_dirty_histories()
+
+
 @tasks.loop(hours=1)
 async def daily_occasion_check():
-    """在节日/重要日期偶尔在公屏说一句。"""
     await discord_client.wait_until_ready()
     if not config.PROACTIVE_CHANNEL_ID:
         return
@@ -429,7 +481,8 @@ async def daily_occasion_check():
     if not occasion:
         return
 
-    if random.random() > 0.80:
+    is_partner_birthday = (occasion == "恋人的生日")
+    if not is_partner_birthday and random.random() > 0.80:
         state._last_occasion_date = today_key
         return
 
@@ -438,11 +491,19 @@ async def daily_occasion_check():
         from ai_client import call_ai
         channel = await discord_client.fetch_channel(config.PROACTIVE_CHANNEL_ID)
         time_ctx = config.get_beijing_time_note()
-        prompt = (
-            f"（系统提示：{time_ctx} 今天是{occasion}。你注意到了这个日子。"
-            "请在公屏发一条极短的、符合你风格的消息，也可以什么都不说 [IGNORE]。"
-            "不要刻意，不要煽情，保持克制。双语格式。）"
-        )
+
+        if is_partner_birthday:
+            prompt = (
+                f"（系统提示：{time_ctx} 今天是恋人的生日（12月10日）。"
+                "你在群里提一句——可以很短，可以含蓄，但不能假装不知道。"
+                "风格保持克制，不要煽情，不要写祝福语套话。双语格式。）"
+            )
+        else:
+            prompt = (
+                f"（系统提示：{time_ctx} 今天是{occasion}。你注意到了这个日子。"
+                "请在公屏发一条极短的、符合你风格的消息，也可以什么都不说 [IGNORE]。"
+                "不要刻意，不要煽情，保持克制。双语格式。）"
+            )
 
         ch_key = history_key_for(channel=channel)
         temp = get_history(ch_key).copy()
@@ -463,7 +524,6 @@ async def daily_occasion_check():
 
 @tasks.loop(hours=1)
 async def daily_status_card():
-    """每天伦敦时间 09 点 偶尔发一张"今日状态卡片"。"""
     global _last_daily_card_date
     await discord_client.wait_until_ready()
     if not config.PROACTIVE_CHANNEL_ID:
@@ -608,7 +668,7 @@ async def check_reminders():
                 reminder_prompt = (
                     f"（系统提示：你之前答应提醒 {target_user.display_name} 的时间到了。"
                     f"提醒内容：「{r['content']}」。"
-                    "请用你的风格发出这条提醒，可以在消息里 @ 对方，简短即可。双语格式。）"
+                    "请用你的风格发出这条提醒，可以在消息里@对方，简短即可。双语格式。）"
                 )
                 temp_history = get_history(history_key_for(channel=ch)).copy()
                 temp_history.append({"role": "user", "content": reminder_prompt})
@@ -624,7 +684,7 @@ async def check_reminders():
             else:
                 user = await discord_client.fetch_user(r["user_id"])
                 reminder_prompt = (
-                    f"（系统提示：你之前答应提醒她的时间到了。提醒内容：「{r['content']}」。"
+                    f"（系统提示：你之前答应提醒恋人的时间到了。提醒内容：「{r['content']}」。"
                     "请用你的私信风格发出这条提醒，简短，双语格式。）"
                 )
                 temp_history = get_history(f"dm:{r['user_id']}").copy()
@@ -635,25 +695,217 @@ async def check_reminders():
                 msgs = [m.strip() for m in clean.split('[SPLIT]') if m.strip()]
                 for msg_text in msgs:
                     await user.send(msg_text)
+            # 仅在成功发送后才删除；失败则保留，下一轮（1 分钟后）重试
             await delete_reminder(r)
             print(f"✅ 提醒已发送: {r['content']}")
         except Exception as e:
             print(f"⚠️ 发送提醒失败（保留待下轮重试）: {e}")
 
 
-@tasks.loop(minutes=45)
+PRESENCE_INSTANT_MIN_SEC = 60
+PRESENCE_INSTANT_MAX_SEC = 3 * 60
+PRESENCE_SUSTAINED_MIN_SEC = 20 * 60
+PRESENCE_SUSTAINED_MAX_SEC = 45 * 60
+
+
+def _should_rotate_presence() -> bool:
+    if state.current_presence is None:
+        return True
+    since = state.current_presence.get("since")
+    if not isinstance(since, datetime):
+        return True
+    elapsed = (datetime.now(timezone.utc) - since).total_seconds()
+    dur_type = state.current_presence.get("duration_type", "sustained")
+    if dur_type == "instant":
+        threshold = random.uniform(PRESENCE_INSTANT_MIN_SEC, PRESENCE_INSTANT_MAX_SEC)
+    else:
+        threshold = random.uniform(PRESENCE_SUSTAINED_MIN_SEC, PRESENCE_SUSTAINED_MAX_SEC)
+    return elapsed >= threshold
+
+
+@tasks.loop(minutes=2)
 async def rotate_presence():
     await discord_client.wait_until_ready()
-    if random.random() < 0.50:
+    if not _should_rotate_presence():
         return
-    if random.random() < 0.30:
+    if random.random() < 0.25:
         bubble_text = await generate_custom_bubble()
         activity = discord.CustomActivity(name=bubble_text)
         await discord_client.change_presence(status=discord.Status.idle, activity=activity)
-        state.set_current_presence("custom", bubble_text, source="rotate-bubble")
+        state.set_current_presence("custom", bubble_text, source="rotate-bubble", duration_type="sustained")
     else:
-        text, activity_type = await generate_presence()
+        text, activity_type, duration_type = await generate_presence()
         activity = discord.Activity(type=activity_type, name=text)
         await discord_client.change_presence(status=discord.Status.idle, activity=activity)
         kind = next((k for k, v in _TYPE_MAP.items() if v == activity_type), "playing")
-        state.set_current_presence(kind, text, source="rotate")
+        state.set_current_presence(kind, text, source="rotate", duration_type=duration_type)
+
+
+# ==== 随机论坛发帖 ====
+RANDOM_POST_PROB = 0.20
+RANDOM_POST_INTERVAL_HOURS = 4
+_last_random_post_date: str = ""
+
+@tasks.loop(hours=4)
+async def random_forum_post():
+    global _last_random_post_date
+    await discord_client.wait_until_ready()
+    if not config.PROACTIVE_CHANNEL_ID:
+        return
+
+    now_bj = datetime.now(ZoneInfo("Asia/Shanghai"))
+    if not (10 <= now_bj.hour <= 23):
+        return
+
+    today_key = now_bj.strftime("%Y-%m-%d")
+    if _last_random_post_date == today_key:
+        return
+
+    if random.random() > RANDOM_POST_PROB:
+        return
+
+    _last_random_post_date = today_key
+
+    try:
+        from ai_client import call_ai
+        channel = await discord_client.fetch_channel(config.PROACTIVE_CHANNEL_ID)
+        if not isinstance(channel, discord.ForumChannel):
+            return
+
+        time_ctx = config.get_beijing_time_note()
+        prompt = (
+            f"（系统提示：{time_ctx} 你现在打开了自己的论坛频道，想随手发一个帖子。\n"
+            "帖子主题可以是你最近在思考的事、看到的东西、读的书、听的音乐、"
+            "某个回忆、一段观察、一个无聊的想法，或者任何你觉得值得写两句的东西。\n"
+            "风格保持克制、真实，不要鸡汤，不要太长。双语格式。\n"
+            "不要提到恋人。\n\n"
+            "输出格式：严格只输出一个JSON对象，包含两个字段：\n"
+            '- "title": 帖子标题（简短，10-30字，双语）\n'
+            '- "content": 帖子正文（50-200字，双语）\n'
+            '示例：{"title":"...","content":"..."}\n'
+            "现在输出："
+        )
+        response = await ai_chat_create(
+            model=config.MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "你是一个JSON生成助手。用户会描述需要的字段，你只输出一个合法的JSON对象，不加任何多余文字。"},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=8192,
+            temperature=0.85,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+        data = _extract_json_object(raw)
+        if not data or "title" not in data or "content" not in data:
+            print(f"⚠️ 随机发帖: AI 返回无效数据: {raw[:200]!r}")
+            return
+
+        thread, first_msg = await channel.create_thread(
+            name=data["title"],
+            content=data["content"],
+            auto_archive_duration=1440,
+        )
+        await asyncio.sleep(1.0)
+        _auto_emojis = ["📖", "🖊️", "🩶", "🫡", "📌", "💭", "☕", "🌙"]
+        try:
+            await first_msg.add_reaction(random.choice(_auto_emojis))
+        except Exception:
+            pass
+        print(f"✅ 随机论坛发帖: {data['title']}")
+    except Exception as e:
+        print(f"⚠️ 随机论坛发帖失败: {e}")
+
+
+# ==== 论坛帖子互动（反应+评论）====
+@tasks.loop(hours=3)
+async def forum_interaction():
+    await discord_client.wait_until_ready()
+    if not config.PROACTIVE_CHANNEL_ID:
+        return
+
+    now_bj = datetime.now(ZoneInfo("Asia/Shanghai"))
+    if not (9 <= now_bj.hour <= 23):
+        return
+
+    if random.random() > 0.35:
+        return
+
+    try:
+        channel = await discord_client.fetch_channel(config.PROACTIVE_CHANNEL_ID)
+        if not isinstance(channel, discord.ForumChannel):
+            return
+
+        threads = list(channel.threads)
+        if not threads:
+            return
+
+        recent_threads = sorted(
+            threads,
+            key=lambda t: t.created_at or discord.utils.snowflake_time(t.id),
+            reverse=True,
+        )[:10]
+
+        target = random.choice(recent_threads)
+
+        messages = []
+        async for msg in target.history(limit=5, oldest_first=True):
+            messages.append(msg)
+        if not messages:
+            return
+
+        action = random.choice(["react", "react", "comment"])
+
+        if action == "react":
+            eligible = [m for m in messages if m.author.id != discord_client.user.id]
+            if not eligible:
+                eligible = messages[:1]
+            msg_to_react = random.choice(eligible)
+            react_emojis = ["👀", "🩶", "📖", "☕", "💭", "🌙", "✨", "🫡", "🖊️"]
+            try:
+                await msg_to_react.add_reaction(random.choice(react_emojis))
+                print(f"✅ 论坛互动: 对帖子 [{target.name}] 添加反应")
+            except Exception as e:
+                print(f"⚠️ 论坛互动反应失败: {e}")
+
+        elif action == "comment":
+            from ai_client import call_ai
+            first_msg = messages[0]
+            post_content = first_msg.content or "(embed/无文字)"
+            recent_replies = ""
+            if len(messages) > 1:
+                reply_parts = []
+                for m in messages[1:]:
+                    author = "T.S." if m.author.id == discord_client.user.id else m.author.display_name
+                    reply_parts.append(f"{author}: {m.content[:100]}")
+                recent_replies = "\n最近的回复：\n" + "\n".join(reply_parts)
+
+            time_ctx = config.get_beijing_time_note()
+            prompt = (
+                f"（系统提示：{time_ctx} 你在论坛上看到一个帖子。\n"
+                f"标题：{target.name}\n"
+                f"内容：{post_content[:300]}\n"
+                f"{recent_replies}\n\n"
+                "你打算在这个帖子下面留一条简短的评论。风格保持克制、自然。\n"
+                "如果帖子是你自己发的，可以补充一句或自言自语。\n"
+                "如果是别人的帖子，随便评论两句。双语格式。\n"
+                "也可以选择不评论 [IGNORE]。\n"
+                "直接输出评论内容，不要加任何前缀。）"
+            )
+            ch_key = history_key_for(channel=target)
+            temp_history = get_history(ch_key).copy()
+            temp_history.append({"role": "user", "content": prompt})
+            raw = await call_ai(temp_history)
+            if "[IGNORE]" in raw.upper():
+                print(f"📝 论坛互动: AI 选择不评论 [{target.name}]")
+                return
+            clean = re.sub(r'\[REACTION:.*?\]\n?', '', raw, flags=re.DOTALL)
+            clean = re.sub(r'\[ACTION\].*?\[/ACTION\]\n?', '', clean, flags=re.DOTALL)
+            clean = re.sub(r'<think>.*?</think>', '', clean, flags=re.DOTALL).strip()
+            if clean:
+                msgs = [m.strip() for m in clean.split('[SPLIT]') if m.strip()]
+                for msg_text in msgs:
+                    await target.send(msg_text)
+                    await asyncio.sleep(1.0)
+                print(f"✅ 论坛互动: 在帖子 [{target.name}] 下评论")
+    except Exception as e:
+        print(f"⚠️ 论坛互动失败: {e}")

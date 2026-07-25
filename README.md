@@ -149,7 +149,7 @@ python bot.py
 ## 想加点什么
 
 - **加自己的生日/纪念日触发**：编辑 `config.py` 里的 `IMPORTANT_DATES` 列表，append 一行 `{"month": 12, "day": 10, "label": "她的生日", "enabled": True}`。
-- **让 T.S. 知道你的朋友**：直接写进 `partner_profile.local.md` 的「朋友 / 关系网」段落。代码层面已经不再区分"恋人的朋友"——这是有意的选择，T.S. 对陌生人保持距离是他的人设。
+- **让 T.S. 知道你的朋友**：把人物关系写进 `partner_profile.local.md` 的「朋友 / 关系网」段落；如需允许这些朋友私信 bot，并让事件处理层识别其身份，再把 Discord 用户 ID 填进 `PARTNER_FRIEND_IDS`。
 - **改 T.S. 的本体设定**：编辑 `prompts.py`。但你改了之后，他就不再是大家共享的那个 T.S. 了。
 
 ---

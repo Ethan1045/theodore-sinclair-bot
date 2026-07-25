@@ -8,6 +8,7 @@
 import asyncio
 import traceback as _tb
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 # ==== 强制指令 ====
 mandatory_instruction = None
@@ -15,7 +16,7 @@ mandatory_instruction = None
 # ==== 防刷屏冷却 ====
 user_cooldowns: dict[int, datetime] = {}
 
-# ==== 恋人最近活动时间 ====
+# ==== 恋人 最近活动时间 ====
 last_partner_activity_at: datetime | None = None
 
 # ==== Discord presence 状态 ====
@@ -23,13 +24,14 @@ current_presence: dict | None = None
 last_presence_change_at: datetime | None = None
 
 
-def set_current_presence(kind: str, text: str, *, source: str = "auto"):
+def set_current_presence(kind: str, text: str, *, source: str = "auto", duration_type: str = "sustained"):
     global current_presence, last_presence_change_at
     current_presence = {
         "kind": kind,
         "text": text,
         "since": datetime.now(timezone.utc),
         "source": source,
+        "duration_type": duration_type,
     }
     last_presence_change_at = current_presence["since"]
 
@@ -52,7 +54,8 @@ def presence_hint_text() -> str:
         "custom":    "现在的状态",
     }
     label = label_map.get(kind, "现在的状态")
-    duration = f"，已经持续约 {mins} 分钟" if mins >= 5 else ""
+    dur_type = current_presence.get("duration_type", "sustained")
+    duration = f"，已经持续约 {mins} 分钟" if mins >= 5 and dur_type != "instant" else ""
     return (
         f"\n（系统背景：你的头像状态此刻显示「{label}：{text}」{duration}。"
         "若话题自然契合，可以顺手带出，但不要硬提；如果聊到了相关音乐/书/活动，"
@@ -67,7 +70,7 @@ reminders_lock: "asyncio.Lock | None" = None
 # ==== 吃饭/睡觉提醒冷却 ====
 care_reminder_last: dict[str, datetime] = {}
 
-# ==== 恋人上线感知 ====
+# ==== 恋人 上线感知 ====
 partner_last_seen_online: datetime | None = None
 
 # ==== 节日发言防重复 ====
@@ -86,6 +89,7 @@ _histories: dict[str, list[dict]] = {}
 _dirty_history_buckets: set[str] = set()
 _bucket_locks: dict[str, asyncio.Lock] = {}
 _bucket_touched: dict[str, datetime] = {}
+# 正在做 LLM 摘要压缩的桶，避免并发重复摘要（trim_history 用）
 _trimming: set[str] = set()
 
 history_lock: "asyncio.Lock | None" = None
@@ -127,9 +131,12 @@ def touch_bucket(key: str) -> None:
 
 
 def mark_history_dirty(key: str) -> None:
-    from config import SYSTEM_HISTORY_KEY
-    if key and key != SYSTEM_HISTORY_KEY:
-        _dirty_history_buckets.add(key)
+    from config import SYSTEM_HISTORY_KEY, PARTNER_USER_ID
+    if not key or key == SYSTEM_HISTORY_KEY:
+        return
+    if key.startswith("dm:") and key != f"dm:{PARTNER_USER_ID}":
+        return
+    _dirty_history_buckets.add(key)
 
 
 def spawn_bg(coro, *, name: str = "bg"):

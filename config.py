@@ -1,6 +1,7 @@
 """所有配置常量与密钥加载。无内部依赖，任何模块都可安全 import。"""
 import os
 import json
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -19,10 +20,12 @@ MERGE_MAX_BATCH = int(os.getenv("MERGE_MAX_BATCH", "6") or "6")
 
 # ==== 历史桶闲置清理 ====
 HISTORY_IDLE_DAYS = int(os.getenv("HISTORY_IDLE_DAYS", "7") or "7")
+FRIEND_MAX_HISTORY = 6
+FRIEND_HISTORY_IDLE_DAYS = 1
 
 # ==== AI 限流 ====
 AI_MAX_RPM = int(os.getenv("AI_MAX_RPM", "15") or "15")
-DAILY_TOKEN_BUDGET = 0  # 在下面覆盖
+DAILY_TOKEN_BUDGET = 0  # 在 _load() 里覆盖
 
 # ==== 安静频道衰减系数 ====
 QUIET_CHANNEL_FACTOR = 0.15
@@ -33,6 +36,7 @@ PRESENCE_CHANGE_COOLDOWN_SEC = 10 * 60
 # ==== 记忆条数上限 ====
 MEMORY_LIMIT = 30
 MEMORY_TARGET = 24
+MEMORY_MAX_AGE_DAYS = 45
 MEMORY_CATEGORIES = ("健康", "偏好", "关系", "计划", "情绪", "日期", "日常")
 
 
@@ -105,7 +109,10 @@ MODEL_NAME = (
     or str(_secrets.get("MODEL_NAME", "")).strip()
     or "gpt-4o"
 )
-DATABASE_URL = (os.getenv("DATABASE_URL", "").strip() or str(_secrets.get("DATABASE_URL", "")).strip())
+DATABASE_URL = (
+    os.getenv("DATABASE_URL", "").strip()
+    or str(_secrets.get("DATABASE_URL", "")).strip()
+)
 
 DAILY_TOKEN_BUDGET = int(os.getenv("DAILY_TOKEN_BUDGET", str(_secrets.get("DAILY_TOKEN_BUDGET", "0"))) or "0")
 
@@ -117,23 +124,18 @@ SILENT_CHANNEL_IDS: set[int] = _read_id_set("SILENT_CHANNEL_IDS")
 
 # ==== 用户 ID ====
 PARTNER_USER_ID = _read_int_id("PARTNER_USER_ID")
-DM_WHITELIST_IDS = {PARTNER_USER_ID} if PARTNER_USER_ID else set()
+PARTNER_FRIEND_IDS: set[int] = _read_id_set("PARTNER_FRIEND_IDS")
+DM_WHITELIST_IDS = {PARTNER_USER_ID} | PARTNER_FRIEND_IDS
 
 # ==== 启动检查 ====
 if not DISCORD_TOKEN:
-    raise RuntimeError("缺少 DISCORD_TOKEN（请在 secrets.local.json 或环境变量里设置）")
+    raise RuntimeError("缺少 DISCORD_TOKEN（环境变量或 secrets.local.json）")
 if not API_KEY:
-    raise RuntimeError("缺少 OPENAI_API_KEY/API_KEY（请在 secrets.local.json 或环境变量里设置）")
+    raise RuntimeError("缺少 OPENAI_API_KEY/API_KEY（环境变量或 secrets.local.json）")
 if not PARTNER_USER_ID:
-    print(
-        "⚠️ 警告：PARTNER_USER_ID 未配置。T.S. 仍能跑，但他将无法识别你为「她」，"
-        "也不会触发恋人专属的回复概率、主动私信、记忆系统、上线感知等。"
-        "强烈建议在 secrets.local.json 或环境变量里填上你自己的 Discord 用户 ID。"
-    )
+    raise RuntimeError("缺少 PARTNER_USER_ID 配置（请在 secrets.local.json 或环境变量里设置）")
 
-# ==== 重要日期（玩家可自由增减） ====
-# 想加自己的生日/纪念日，在下面 append 一条即可：
-#   {"month": 12, "day": 10, "label": "她的生日", "enabled": True}
+# ==== 重要日期 ====
 IMPORTANT_DATES: list[dict] = [
     {"month": 1,  "day": 1,  "label": "新年",        "enabled": True},
     {"month": 2,  "day": 14, "label": "情人节",      "enabled": True},
@@ -167,3 +169,14 @@ def get_beijing_time_note() -> str:
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
     weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()]
     return f"（系统时间：北京时间现在是 {now.strftime('%Y-%m-%d')} {weekday_cn} {now.strftime('%H:%M')}。）"
+
+
+def get_presence_time_context() -> str:
+    now_london = datetime.now(ZoneInfo("Europe/London"))
+    now_beijing = datetime.now(ZoneInfo("Asia/Shanghai"))
+    weekday_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][now_london.weekday()]
+    weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now_beijing.weekday()]
+    return (
+        f"(Your local time — London: {now_london.strftime('%Y-%m-%d')} {weekday_en} {now_london.strftime('%H:%M')}. "
+        f"Your partner's time — Beijing: {now_beijing.strftime('%Y-%m-%d')} {weekday_cn} {now_beijing.strftime('%H:%M')}.)"
+    )

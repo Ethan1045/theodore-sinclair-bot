@@ -178,6 +178,7 @@ async def execute_action(action_json_str: str, trigger_message: discord.Message)
         action_type = data.get("type", "").upper()
         guild = trigger_message.guild
 
+        DM_ALLOWED_ACTIONS = {"ADD_COINS", "ADD_XP", "SEND_DM"}
         DESTRUCTIVE_ACTIONS = {
             "KICK", "BAN", "TIMEOUT",
             "ADD_ROLE", "REMOVE_ROLE", "CREATE_ROLE",
@@ -193,8 +194,8 @@ async def execute_action(action_json_str: str, trigger_message: discord.Message)
             requester_is_bot = bool(getattr(requester, "bot", False))
             requester_perms = getattr(requester, "guild_permissions", None)
             is_admin = bool(requester_perms and getattr(requester_perms, "administrator", False))
-            is_partner = bool(config.PARTNER_USER_ID) and (requester_id == config.PARTNER_USER_ID)
-            if guild is None:
+            is_partner = (requester_id == config.PARTNER_USER_ID)
+            if guild is None and action_type not in DM_ALLOWED_ACTIONS:
                 print(f"🛡️ 拒绝执行 {action_type}：非 guild 上下文。 raw={action_json_str[:200]}")
                 return f"⚠️ 操作未执行：{action_type} 不允许在私聊中触发。"
             if requester_is_bot:
@@ -202,12 +203,12 @@ async def execute_action(action_json_str: str, trigger_message: discord.Message)
                 return f"⚠️ 操作未执行：{action_type} 不允许由 bot 触发。"
             if action_type in {"ADD_COINS", "ADD_XP"}:
                 if not is_partner:
-                    print(f"🛡️ 拒绝执行 {action_type}：发起者 {requester_id} 不是 PARTNER。 raw={action_json_str[:200]}")
-                    return f"⚠️ 操作未执行：{action_type} 只允许 PARTNER 触发（实际发起者 ID={requester_id}）。"
+                    print(f"🛡️ 拒绝执行 {action_type}：发起者 {requester_id} 不是 恋人。 raw={action_json_str[:200]}")
+                    return f"⚠️ 操作未执行：{action_type} 只允许 恋人 触发（实际发起者 ID={requester_id}）。"
             else:
                 if not (is_partner or is_admin):
-                    print(f"🛡️ 拒绝执行 {action_type}：发起者 {requester_id} 既不是 PARTNER 也不是管理员。 raw={action_json_str[:200]}")
-                    return f"⚠️ 操作未执行：{action_type} 需要 PARTNER 或管理员发起（实际发起者 ID={requester_id}）。"
+                    print(f"🛡️ 拒绝执行 {action_type}：发起者 {requester_id} 既不是 恋人 也不是管理员。 raw={action_json_str[:200]}")
+                    return f"⚠️ 操作未执行：{action_type} 需要 恋人 或管理员发起（实际发起者 ID={requester_id}）。"
 
         raw_channel_id = data.get("channel_id")
         channel_id = extract_id(raw_channel_id) if extract_id(raw_channel_id) else trigger_message.channel.id
@@ -405,10 +406,11 @@ async def execute_action(action_json_str: str, trigger_message: discord.Message)
             await user.send(data.get("content", "."))
             print(f"✅ 私信发送成功")
 
-        elif action_type == "ADD_COINS" and guild:
+        elif action_type == "ADD_COINS":
+            resolved_guild_id = str(guild.id) if guild else "dm"
             u_id = extract_id(data.get("user_id"))
             amount = int(data.get("amount", 0))
-            if u_id and amount != 0 and config.DATABASE_URL:
+            if u_id and amount != 0 and config.DATABASE_URL and resolved_guild_id:
                 try:
                     async with _db.db_conn() as conn:
                         async with conn.cursor() as cur:
@@ -417,20 +419,23 @@ async def execute_action(action_json_str: str, trigger_message: discord.Message)
                                 VALUES (%s, %s, GREATEST(%s, 0))
                                 ON CONFLICT (guild_id, user_id) DO UPDATE
                                     SET balance = GREATEST(users.balance + %s, 0)
-                            """, (str(guild.id), str(u_id), amount, amount))
+                            """, (resolved_guild_id, str(u_id), amount, amount))
                             await cur.execute(
                                 "SELECT balance, bank FROM users WHERE guild_id=%s AND user_id=%s",
-                                (str(guild.id), str(u_id))
+                                (resolved_guild_id, str(u_id))
                             )
                             row = await cur.fetchone()
                             await conn.commit()
                     new_balance = row[0] if row else max(amount, 0)
                     new_bank    = row[1] if row else 0
                     sign = "+" if amount > 0 else ""
-                    try:
-                        target_member = guild.get_member(u_id) or await guild.fetch_member(u_id)
-                        mention = target_member.mention
-                    except Exception:
+                    if guild:
+                        try:
+                            target_member = guild.get_member(u_id) or await guild.fetch_member(u_id)
+                            mention = target_member.mention
+                        except Exception:
+                            mention = f"<@{u_id}>"
+                    else:
                         mention = f"<@{u_id}>"
                     await trigger_message.channel.send(
                         f"-# 💰 {mention} 金币变动 {sign}{amount}🪙 ｜ 现金 {new_balance}🪙 · 银行 {new_bank}🪙"
@@ -440,10 +445,11 @@ async def execute_action(action_json_str: str, trigger_message: discord.Message)
                     print(f"❌ 操作金币失败: {e}")
                     raise
 
-        elif action_type == "ADD_XP" and guild:
+        elif action_type == "ADD_XP":
+            resolved_guild_id = str(guild.id) if guild else "dm"
             u_id = extract_id(data.get("user_id"))
             amount = int(data.get("amount", 0))
-            if u_id and amount != 0 and config.DATABASE_URL:
+            if u_id and amount != 0 and config.DATABASE_URL and resolved_guild_id:
                 try:
                     async with _db.db_conn() as conn:
                         async with conn.cursor() as cur:
@@ -452,8 +458,8 @@ async def execute_action(action_json_str: str, trigger_message: discord.Message)
                                 VALUES (%s, %s, GREATEST(%s, 0), 1)
                                 ON CONFLICT (guild_id, user_id) DO UPDATE
                                     SET xp = GREATEST(users.xp + %s, 0)
-                            """, (str(guild.id), str(u_id), amount, amount))
-                            await cur.execute("SELECT xp FROM users WHERE guild_id=%s AND user_id=%s", (str(guild.id), str(u_id)))
+                            """, (resolved_guild_id, str(u_id), amount, amount))
+                            await cur.execute("SELECT xp FROM users WHERE guild_id=%s AND user_id=%s", (resolved_guild_id, str(u_id)))
                             row = await cur.fetchone()
                             new_xp = row[0] if row else 0
                             level = 1
@@ -463,14 +469,17 @@ async def execute_action(action_json_str: str, trigger_message: discord.Message)
                                 level += 1
                             await cur.execute(
                                 "UPDATE users SET level=%s WHERE guild_id=%s AND user_id=%s",
-                                (level, str(guild.id), str(u_id))
+                                (level, resolved_guild_id, str(u_id))
                             )
                             await conn.commit()
                     sign = "+" if amount > 0 else ""
-                    try:
-                        target_member = guild.get_member(u_id) or await guild.fetch_member(u_id)
-                        mention = target_member.mention
-                    except Exception:
+                    if guild:
+                        try:
+                            target_member = guild.get_member(u_id) or await guild.fetch_member(u_id)
+                            mention = target_member.mention
+                        except Exception:
+                            mention = f"<@{u_id}>"
+                    else:
                         mention = f"<@{u_id}>"
                     await trigger_message.channel.send(
                         f"-# 🌟 {mention} 经验变动 {sign}{amount} XP ｜ 当前 {new_xp} XP (Lv.{level})"

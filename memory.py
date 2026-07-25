@@ -1,4 +1,5 @@
 """长期记忆系统、提醒系统、bot_config 持久化、每日对话摘要。"""
+import asyncio
 import re
 from datetime import datetime, timezone, date, timedelta
 from zoneinfo import ZoneInfo
@@ -7,6 +8,7 @@ import config
 import state
 import db as _db
 from ai_client import ai_chat_create
+from history import get_history
 
 # ==== 记忆分类 ====
 _CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
@@ -14,7 +16,7 @@ _CATEGORY_KEYWORDS: dict[str, tuple[str, ...]] = {
             "胃", "牙", "嗓子", "头晕", "经期", "例假"),
     "偏好": ("喜欢", "讨厌", "爱吃", "不吃", "最爱", "最讨厌", "偏好", "口味", "好喝", "好吃", "难吃"),
     "关系": ("妈妈", "爸爸", "妈", "爸", "姐", "弟", "妹", "朋友", "同学", "猫", "狗",
-            "宠物"),
+            "宠物", "男朋友", "前任"),
     "计划": ("打算", "准备", "想去", "下周", "下个月", "明天", "考试", "旅行", "出差",
             "约", "deadline", "ddl", "面试"),
     "情绪": ("开心", "难过", "焦虑", "压力", "烦", "委屈", "生气", "兴奋", "失落",
@@ -126,34 +128,12 @@ async def ensure_bot_config_table():
         print(f"⚠️ bot_config 表初始化失败: {e}")
 
 
-async def ensure_users_table():
-    if not config.DATABASE_URL:
-        return
-    try:
-        async with _db.db_conn() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("""
-                    CREATE TABLE IF NOT EXISTS users (
-                        guild_id TEXT NOT NULL,
-                        user_id TEXT NOT NULL,
-                        balance BIGINT NOT NULL DEFAULT 0,
-                        bank BIGINT NOT NULL DEFAULT 0,
-                        xp BIGINT NOT NULL DEFAULT 0,
-                        level INT NOT NULL DEFAULT 1,
-                        PRIMARY KEY (guild_id, user_id)
-                    )
-                """)
-                await conn.commit()
-        print("✅ users 表已就绪")
-    except Exception as e:
-        print(f"⚠️ users 表初始化失败: {e}")
-
-
 # ==== bot_config 持久化 ====
 
 _PERSISTED_CONFIG_KEYS: dict[str, type] = {
     "DAILY_CARD_PROB_NORMAL": float,
     "DAILY_CARD_PROB_OCCASION": float,
+    "RANDOM_POST_PROB": float,
     "STALE_POST_AGE_DAYS": int,
     "STALE_POST_MAX_REPLIES": int,
     "CLEANUP_INTERVAL_HOURS": int,
@@ -212,6 +192,8 @@ def _apply_persisted_config(parsed: dict) -> None:
         tasks_bg.CLEANUP_ENABLED = parsed["CLEANUP_ENABLED"]
     if "DAILY_CARD_ENABLED" in parsed:
         tasks_bg.DAILY_CARD_ENABLED = parsed["DAILY_CARD_ENABLED"]
+    if "RANDOM_POST_PROB" in parsed:
+        tasks_bg.RANDOM_POST_PROB = parsed["RANDOM_POST_PROB"]
 
 
 async def save_persisted_config(updates: dict):
@@ -261,6 +243,8 @@ async def add_reminder(trigger_at: datetime, user_id: int, content: str, channel
 
 
 async def fetch_due_reminders(now: datetime) -> list[dict]:
+    """取出到期提醒，但**不删除**——删除推迟到发送成功后由 delete_reminder() 完成，
+    避免发送失败（AI 报错/网络问题）时提醒被永久丢失。未删除的会在下一轮重试。"""
     out: list[dict] = []
     if config.DATABASE_URL:
         try:
@@ -293,6 +277,7 @@ async def fetch_due_reminders(now: datetime) -> list[dict]:
 
 
 async def delete_reminder(item: dict) -> None:
+    """发送成功后调用，真正移除该提醒。失败仅记录日志（最坏下一轮重复触发）。"""
     src = item.get("_source")
     if src == "db" and config.DATABASE_URL and item.get("id") is not None:
         try:
@@ -313,8 +298,7 @@ async def delete_reminder(item: dict) -> None:
 # ==== 长期记忆 ====
 
 async def extract_and_save_memory(user_id: str, user_message: str):
-    # 只为「她」存长期记忆：模板里其他人没必要建档案。
-    if not config.PARTNER_USER_ID or str(user_id) != str(config.PARTNER_USER_ID):
+    if str(user_id) != str(config.PARTNER_USER_ID):
         return
     if not config.DATABASE_URL or len(user_message.strip()) < 8:
         return
@@ -464,10 +448,37 @@ async def extract_and_save_memory(user_id: str, user_message: str):
         print(f"⚠️ 记忆提取/更新失败: {e}")
 
 
+_KEEP_CATEGORIES = {"日期", "关系"}
+
+
+async def _delete_aged_memories(user_id: str):
+    try:
+        async with _db.db_conn() as conn:
+            async with conn.cursor() as cur:
+                cutoff = datetime.now(timezone.utc) - timedelta(days=config.MEMORY_MAX_AGE_DAYS)
+                await cur.execute(
+                    """DELETE FROM user_notes
+                       WHERE user_id = %s
+                         AND created_at < %s
+                         AND (category IS NULL OR category NOT IN ('日期', '关系'))
+                       RETURNING id, note""",
+                    (user_id, cutoff),
+                )
+                deleted = await cur.fetchall()
+                if deleted:
+                    await conn.commit()
+                    print(f"🧹 记忆年龄清理：删除 {len(deleted)} 条超过 {config.MEMORY_MAX_AGE_DAYS} 天的旧记忆")
+    except Exception as e:
+        print(f"⚠️ 记忆年龄清理失败: {e}")
+
+
 async def prune_memories_if_needed(user_id: str):
     if not config.DATABASE_URL:
         return
     try:
+        if config.MEMORY_MAX_AGE_DAYS > 0:
+            await _delete_aged_memories(user_id)
+
         async with _db.db_conn() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -583,7 +594,7 @@ async def fetch_memory_context(user_id: str, n: int = 4, topic_hint: str | None 
         if not lines and not summary_block:
             return ""
 
-        head = "\n\n（系统记忆：以下是她近期提到过的细节，你自然记得，不必每次都提，话题自然契合时可以轻轻带出——但绝对不要说'我记得你说过'，直接当作共同认知使用："
+        head = "\n\n（系统记忆：以下是恋人近期提到过的细节，你自然记得，不必每次都提，话题自然契合时可以轻轻带出——但绝对不要说'我记得你说过'，直接当作共同认知使用："
         body = "\n".join(lines) if lines else "  · （暂无具体记忆条目）"
         tail = "）"
         return head + "\n" + body + summary_block + tail
