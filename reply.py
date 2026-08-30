@@ -1,5 +1,6 @@
 """send_ai_reply 与 _keep_typing：处理 AI 输出并发送到 Discord。"""
 import asyncio
+import json
 import random
 from datetime import datetime, timezone
 
@@ -64,10 +65,10 @@ async def send_ai_reply(raw_bot_reply: str, trigger_message: discord.Message, ch
             sent_message = await channel.send(msg_text)
 
     if emojis_to_react:
-        if reaction_target == "USER" or not sent_message:
-            target_msg = trigger_message
-        else:
+        if reaction_target == "SELF" and sent_message:
             target_msg = sent_message
+        else:
+            target_msg = trigger_message
         for emoji in emojis_to_react:
             try:
                 await target_msg.add_reaction(emoji)
@@ -75,7 +76,18 @@ async def send_ai_reply(raw_bot_reply: str, trigger_message: discord.Message, ch
                 print(f"挂表情失败 ({classify_discord_error(e)}): emoji={emoji} target_msg={getattr(target_msg,'id',None)}")
 
     for action_str in action_matches:
-        await execute_action(action_str, trigger_message)
+        try:
+            action_type = str(json.loads(action_str).get("type", "")).upper()
+        except Exception:
+            action_type = ""
+        if action_type == "EDIT_OWN_MESSAGE":
+            # Editing deliberately happens seconds later without holding up the event handler.
+            state.spawn_bg(
+                execute_action(action_str, trigger_message, response_message=sent_message),
+                name=f"refine:{getattr(sent_message, 'id', 'none')}",
+            )
+        else:
+            await execute_action(action_str, trigger_message, response_message=sent_message)
 
     if history_text:
         _eat_kws = ["吃了吗", "吃饭了吗", "吃了没", "have you eaten", "eaten yet", "吃东西", "记得吃"]

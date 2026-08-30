@@ -74,6 +74,10 @@ async def apply_presence(kind: str, text: str, *, source: str) -> bool:
 
 
 async def try_explicit_activity_sync(text: str) -> None:
+    # The persistent day plan is the source of truth; ad-hoc keyword changes
+    # would make the avatar disagree with reply/proactive context.
+    if state.current_life_slot:
+        return
     if not text or not _presence_cooldown_ok():
         return
     m = _EXPLICIT_ACTIVITY_RE.search(text)
@@ -89,6 +93,8 @@ async def try_explicit_activity_sync(text: str) -> None:
 
 
 async def try_keyword_presence_update(text: str) -> None:
+    if state.current_life_slot:
+        return
     if random.random() > 0.35:
         return
     if not _presence_cooldown_ok():
@@ -109,6 +115,8 @@ async def generate_presence() -> tuple[str, discord.ActivityType, str]:
         "The status appears next to his avatar as 'Listening to xxx' / 'Playing xxx' / 'Watching xxx'.\n\n"
         "【Rules】\n"
         "1. Base the activity on HIS London local time — what would he plausibly be doing right now?\n"
+        "1a. His temperament is consistently gentle, composed, restrained, highly capable and well-mannered. The status must fit his established life: family-office work, foundation governance, archival/book conservation, serious reading, fencing, swimming, riding, tea, restrained music listening or quiet travel.\n"
+        "1b. Do not invent quirky habits, comic incompetence, flippant thoughts, internet slang, attention-seeking moods, melodrama or random contrast for 'human realism'. Never make him look unserious or out of character.\n"
         "2. listening → a real song / album / artist\n"
         "3. playing → a specific thing he's doing\n"
         "4. watching → something he's observing or paying attention to\n"
@@ -152,10 +160,10 @@ async def generate_presence() -> tuple[str, discord.ActivityType, str]:
 
         if text in state._recent_presences:
             fallback_texts = [
-                "Restoring a 19th c. spine", "Quietly bullying spreadsheets",
+                "Restoring a 19th c. spine", "Reviewing family-office papers",
                 "Window light on old paper", "Late letters to Geneva",
-                "Listening for your typing", "Re-shelving first editions",
-                "Adjusting cufflinks again", "Watching London fog collect",
+                "Chet Baker in the study", "Re-shelving first editions",
+                "Foundation papers", "Watching London fog collect",
             ]
             unused = [t for t in fallback_texts if t not in state._recent_presences]
             text = random.choice(unused or fallback_texts)
@@ -276,5 +284,20 @@ def get_guild_emoji_hint(guild: "discord.Guild | None") -> str:
     return (
         "\n\n【本服务器的自定义表情】你可以在聊天文本里直接使用下列自定义表情（复制粘贴整个尖括号标签即可），"
         "它们会在Discord里正确渲染成表情图片。不要滥用，只在真正合适时用一个。\n"
+        + "\n".join(lines)
+    )
+
+
+def get_guild_sticker_hint(guild: "discord.Guild | None") -> str:
+    """Expose only stickers the bot can actually send in the current guild."""
+    if not guild:
+        return ""
+    stickers = [s for s in guild.stickers if getattr(s, "available", True)]
+    if not stickers:
+        return ""
+    lines = [f"- {s.name}（sticker_id={s.id}）" for s in stickers[:20]]
+    return (
+        "\n\n【本服务器贴纸】极少数时候，你可以不发正文、只用一个服务器贴纸回应。"
+        "仅可从下列清单选择，并输出 SEND_STICKER 动作；不要臆造ID，也不要与文字表情同时滥用。\n"
         + "\n".join(lines)
     )

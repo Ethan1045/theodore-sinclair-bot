@@ -17,6 +17,8 @@ CARE_REMINDER_COOLDOWN_HOURS = 5
 # ==== 消息合并窗口 ====
 MERGE_WINDOW_SEC = float(os.getenv("MERGE_WINDOW_SEC", "4.0") or "4.0")
 MERGE_MAX_BATCH = int(os.getenv("MERGE_MAX_BATCH", "6") or "6")
+TYPING_GRACE_SEC = float(os.getenv("TYPING_GRACE_SEC", "6.0") or "6.0")
+TYPING_MERGE_MAX_SEC = float(os.getenv("TYPING_MERGE_MAX_SEC", "15.0") or "15.0")
 
 # ==== 历史桶闲置清理 ====
 HISTORY_IDLE_DAYS = int(os.getenv("HISTORY_IDLE_DAYS", "7") or "7")
@@ -38,6 +40,42 @@ MEMORY_LIMIT = 30
 MEMORY_TARGET = 24
 MEMORY_MAX_AGE_DAYS = 45
 MEMORY_CATEGORIES = ("健康", "偏好", "关系", "计划", "情绪", "日期", "日常")
+
+# ==== 睡眠模式（伦敦时区）====
+SLEEP_START_HOUR = 0       # 默认入睡时间（伦敦时间 00:00）
+SLEEP_END_HOUR = 5         # 默认醒来时间（伦敦时间 05:00）
+SLEEP_LATE_CHANCE = 0.30   # 熬夜概率（推迟入睡 0.5-1.5h）
+SLEEP_DEEP_START = 1       # 深睡开始（伦敦时间 01:00）
+SLEEP_DEEP_END = 4         # 深睡结束（伦敦时间 04:00）
+
+
+def get_london_hour() -> int:
+    return datetime.now(ZoneInfo("Europe/London")).hour
+
+
+def get_london_minute() -> int:
+    return datetime.now(ZoneInfo("Europe/London")).minute
+
+
+def is_sleep_time() -> tuple[bool, str]:
+    """返回 (是否睡觉, 睡眠阶段: 'deep'|'light'|'awake')"""
+    now = datetime.now(ZoneInfo("Europe/London"))
+    h = now.hour
+    if SLEEP_DEEP_START <= h < SLEEP_DEEP_END:
+        return True, "deep"
+    if h == SLEEP_START_HOUR or h == SLEEP_DEEP_END:
+        return True, "light"
+    if h == SLEEP_END_HOUR and now.minute < 30:
+        return True, "light"
+    return False, "awake"
+
+
+def is_work_time() -> bool:
+    """伦敦时区工作日 9:00-17:00"""
+    now = datetime.now(ZoneInfo("Europe/London"))
+    if now.weekday() >= 5:
+        return False
+    return 9 <= now.hour < 17
 
 
 def load_local_secrets() -> dict:
@@ -121,6 +159,8 @@ PROACTIVE_CHANNEL_ID = int(os.getenv("PROACTIVE_CHANNEL_ID", str(_secrets.get("P
 PARTNER_HOME_CHANNEL_ID = int(os.getenv("PARTNER_HOME_CHANNEL_ID", str(_secrets.get("PARTNER_HOME_CHANNEL_ID", "0"))) or "0")
 QUIET_CHANNEL_IDS: set[int] = _read_id_set("QUIET_CHANNEL_IDS")
 SILENT_CHANNEL_IDS: set[int] = _read_id_set("SILENT_CHANNEL_IDS")
+# 为空时仍只允许触发消息所在 guild；填写后进一步限制目标频道。
+MUTATING_CHANNEL_IDS: set[int] = _read_id_set("MUTATING_CHANNEL_IDS")
 
 # ==== 用户 ID ====
 PARTNER_USER_ID = _read_int_id("PARTNER_USER_ID")

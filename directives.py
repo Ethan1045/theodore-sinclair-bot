@@ -122,7 +122,7 @@ def parse_bot_directives(raw_bot_reply: str):
         if raw_emojis.upper() != "NONE":
             parts_r = [p.strip() for p in raw_emojis.split(',')]
             if parts_r:
-                reaction_target = (parts_r[0] or "SELF").upper()
+                reaction_target = (parts_r[0] or "USER").upper()
                 emojis_to_react = [e for e in parts_r[1:] if e]
 
     action_matches = re.findall(r'\[ACTION\](.*?)\[/ACTION\]', raw_bot_reply, re.DOTALL)
@@ -168,17 +168,33 @@ def _resolve_link_directive(kind: str, query: str) -> str | None:
     qenc = quote_plus(q)
     k = (kind or "").strip().lower()
     if k in ("music", "song", "spotify"):
-        return f"https://song.link/s/{qenc}"
-    if k in ("youtube", "yt", "mv"):
+        return f"https://open.spotify.com/search/{qenc}"
+    if k in ("apple", "applemusic", "am"):
+        return f"https://music.apple.com/search?term={qenc}"
+    if k in ("ytmusic", "youtubemusic"):
+        return f"https://music.youtube.com/search?q={qenc}"
+    if k in ("youtube", "yt", "mv", "video"):
         return f"https://www.youtube.com/results?search_query={qenc}"
+    if k in ("bilibili", "b站", "bili"):
+        return f"https://search.bilibili.com/all?keyword={qenc}"
     if k in ("book", "books"):
         return f"https://www.google.com/search?tbm=bks&q={qenc}"
+    if k in ("douban", "豆瓣"):
+        return f"https://www.douban.com/search?q={qenc}"
     if k in ("wiki", "wikipedia"):
         return f"https://zh.wikipedia.org/wiki/Special:Search?search={qenc}"
+    if k in ("enwiki",):
+        return f"https://en.wikipedia.org/wiki/Special:Search?search={qenc}"
     if k in ("web", "search", "google"):
         return f"https://www.google.com/search?q={qenc}"
     if k in ("map", "maps"):
         return f"https://www.google.com/maps/search/{qenc}"
+    if k in ("steam", "game", "games"):
+        return f"https://store.steampowered.com/search/?term={qenc}"
+    if k in ("imdb",):
+        return f"https://www.imdb.com/find/?q={qenc}"
+    if k in ("github", "gh"):
+        return f"https://github.com/search?q={qenc}"
     return None
 
 

@@ -1,12 +1,14 @@
 """Discord bot 入口：加载模块注册事件/命令，启动健康服务，运行客户端。"""
 import asyncio
 import os
+import selectors
 
 import discord
 
 import config
 import events      # noqa: F401 — registers @discord_client.event handlers
 import slash_cmds  # noqa: F401 — registers @slash_tree.command handlers
+import context_menus  # noqa: F401 — registers message context-menu handlers
 from client import discord_client
 
 
@@ -55,4 +57,12 @@ async def run_bot():
             await asyncio.sleep(30)
 
 
-asyncio.run(run_bot())
+if os.name == "nt":
+    # Python 3.13 的 Windows 默认循环是 ProactorEventLoop，而 psycopg 的
+    # 异步连接需要 SelectorEventLoop。显式传入工厂，避免依赖全局策略。
+    asyncio.run(
+        run_bot(),
+        loop_factory=lambda: asyncio.SelectorEventLoop(selectors.SelectSelector()),
+    )
+else:
+    asyncio.run(run_bot())

@@ -73,6 +73,14 @@ care_reminder_last: dict[str, datetime] = {}
 # ==== 恋人 上线感知 ====
 partner_last_seen_online: datetime | None = None
 
+# ==== 睡眠期间待回复消息 ====
+sleep_pending_messages: list[dict] = []
+
+# ==== 工作忙碌状态 ====
+work_busy_until: datetime | None = None
+work_busy_activity: str = ""
+work_pending_messages: list[dict] = []
+
 # ==== 节日发言防重复 ====
 _last_occasion_date: str = ""
 
@@ -98,6 +106,34 @@ _bg_lock: "asyncio.Lock | None" = None
 
 # ==== 消息合并窗口状态 ====
 _merge_state: dict[tuple, dict] = {}
+
+# ==== 用户正在输入（用于消息合并窗口）====
+user_typing_at: dict[tuple[int, int], float] = {}
+
+# ==== 持久化每日生活状态机 ====
+daily_life_date = None
+daily_life_schedule: list[dict] = []
+current_life_slot: dict | None = None
+
+
+def life_hint_text() -> str:
+    slot = current_life_slot or {}
+    label = (slot.get("label") or "").strip()
+    if not label:
+        return ""
+    availability = slot.get("availability", "available")
+    availability_cn = {
+        "busy": "目前不便长聊",
+        "limited": "可以间歇看消息",
+        "asleep": "正在睡觉",
+        "available": "目前可以正常聊天",
+    }.get(availability, "目前可以正常聊天")
+    proactive = (slot.get("proactive") or "").strip()
+    proactive_hint = f"若你主动开口，可以自然从「{proactive}」生发，但不要硬提。" if proactive else ""
+    return (
+        f"\n（系统背景：按照你今天已经确定的伦敦日程，你此刻{label}，{availability_cn}。"
+        f"回复、主动消息和状态栏必须与这件事一致；不要编造互相冲突的当前位置或活动。{proactive_hint}）"
+    )
 
 # ==== 后台任务追踪 ====
 _bg_tasks: set[asyncio.Task] = set()
