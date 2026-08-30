@@ -92,16 +92,18 @@ async def trim_history(key: str = config.SYSTEM_HISTORY_KEY):
     """
     state.mark_history_dirty(key)
     lock = state.get_bucket_lock(key)
+    is_friend_dm = key.startswith("dm:") and key != f"dm:{config.PARTNER_USER_ID}"
+    max_hist = config.FRIEND_MAX_HISTORY if is_friend_dm else config.MAX_HISTORY
+    trim_to = max(3, max_hist - 3) if is_friend_dm else config.HISTORY_TRIM_TO
     # —— 阶段 1：持锁快照（快） ——
     async with lock:
         h = state._histories.get(key)
-        if not h or len(h) <= config.MAX_HISTORY:
+        if not h or len(h) <= max_hist:
             return
         if key in state._trimming:
-            # 另一协程正在压缩本桶，它会把长度降下来，本次直接跳过避免重复摘要
             return
         state._trimming.add(key)
-        middle = list(h[1:-config.HISTORY_TRIM_TO])
+        middle = list(h[1:-trim_to])
         boundary = 1 + len(middle)  # 快照时刻 recent 段的起始下标
     try:
         # —— 阶段 2：锁外做 LLM 摘要（慢，最长可达 LLM 超时） ——
@@ -241,6 +243,7 @@ async def load_all_histories():
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT bucket_key, messages, updated_at FROM conversation_histories"
+                    " WHERE bucket_key LIKE 'dm:%%' OR bucket_key LIKE 'ch:%%'"
                 )
                 rows = await cur.fetchall()
     except Exception as e:

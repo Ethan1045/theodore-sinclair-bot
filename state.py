@@ -8,6 +8,7 @@
 import asyncio
 import traceback as _tb
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 # ==== 强制指令 ====
 mandatory_instruction = None
@@ -15,7 +16,7 @@ mandatory_instruction = None
 # ==== 防刷屏冷却 ====
 user_cooldowns: dict[int, datetime] = {}
 
-# ==== 恋人最近活动时间 ====
+# ==== 恋人 最近活动时间 ====
 last_partner_activity_at: datetime | None = None
 
 # ==== Discord presence 状态 ====
@@ -23,13 +24,14 @@ current_presence: dict | None = None
 last_presence_change_at: datetime | None = None
 
 
-def set_current_presence(kind: str, text: str, *, source: str = "auto"):
+def set_current_presence(kind: str, text: str, *, source: str = "auto", duration_type: str = "sustained"):
     global current_presence, last_presence_change_at
     current_presence = {
         "kind": kind,
         "text": text,
         "since": datetime.now(timezone.utc),
         "source": source,
+        "duration_type": duration_type,
     }
     last_presence_change_at = current_presence["since"]
 
@@ -52,7 +54,8 @@ def presence_hint_text() -> str:
         "custom":    "现在的状态",
     }
     label = label_map.get(kind, "现在的状态")
-    duration = f"，已经持续约 {mins} 分钟" if mins >= 5 else ""
+    dur_type = current_presence.get("duration_type", "sustained")
+    duration = f"，已经持续约 {mins} 分钟" if mins >= 5 and dur_type != "instant" else ""
     return (
         f"\n（系统背景：你的头像状态此刻显示「{label}：{text}」{duration}。"
         "若话题自然契合，可以顺手带出，但不要硬提；如果聊到了相关音乐/书/活动，"
@@ -67,8 +70,16 @@ reminders_lock: "asyncio.Lock | None" = None
 # ==== 吃饭/睡觉提醒冷却 ====
 care_reminder_last: dict[str, datetime] = {}
 
-# ==== 恋人上线感知 ====
+# ==== 恋人 上线感知 ====
 partner_last_seen_online: datetime | None = None
+
+# ==== 睡眠期间待回复消息 ====
+sleep_pending_messages: list[dict] = []
+
+# ==== 工作忙碌状态 ====
+work_busy_until: datetime | None = None
+work_busy_activity: str = ""
+work_pending_messages: list[dict] = []
 
 # ==== 节日发言防重复 ====
 _last_occasion_date: str = ""
@@ -86,6 +97,7 @@ _histories: dict[str, list[dict]] = {}
 _dirty_history_buckets: set[str] = set()
 _bucket_locks: dict[str, asyncio.Lock] = {}
 _bucket_touched: dict[str, datetime] = {}
+# 正在做 LLM 摘要压缩的桶，避免并发重复摘要（trim_history 用）
 _trimming: set[str] = set()
 
 history_lock: "asyncio.Lock | None" = None
@@ -94,6 +106,34 @@ _bg_lock: "asyncio.Lock | None" = None
 
 # ==== 消息合并窗口状态 ====
 _merge_state: dict[tuple, dict] = {}
+
+# ==== 用户正在输入（用于消息合并窗口）====
+user_typing_at: dict[tuple[int, int], float] = {}
+
+# ==== 持久化每日生活状态机 ====
+daily_life_date = None
+daily_life_schedule: list[dict] = []
+current_life_slot: dict | None = None
+
+
+def life_hint_text() -> str:
+    slot = current_life_slot or {}
+    label = (slot.get("label") or "").strip()
+    if not label:
+        return ""
+    availability = slot.get("availability", "available")
+    availability_cn = {
+        "busy": "目前不便长聊",
+        "limited": "可以间歇看消息",
+        "asleep": "正在睡觉",
+        "available": "目前可以正常聊天",
+    }.get(availability, "目前可以正常聊天")
+    proactive = (slot.get("proactive") or "").strip()
+    proactive_hint = f"若你主动开口，可以自然从「{proactive}」生发，但不要硬提。" if proactive else ""
+    return (
+        f"\n（系统背景：按照你今天已经确定的伦敦日程，你此刻{label}，{availability_cn}。"
+        f"回复、主动消息和状态栏必须与这件事一致；不要编造互相冲突的当前位置或活动。{proactive_hint}）"
+    )
 
 # ==== 后台任务追踪 ====
 _bg_tasks: set[asyncio.Task] = set()
@@ -127,9 +167,12 @@ def touch_bucket(key: str) -> None:
 
 
 def mark_history_dirty(key: str) -> None:
-    from config import SYSTEM_HISTORY_KEY
-    if key and key != SYSTEM_HISTORY_KEY:
-        _dirty_history_buckets.add(key)
+    from config import SYSTEM_HISTORY_KEY, PARTNER_USER_ID
+    if not key or key == SYSTEM_HISTORY_KEY:
+        return
+    if key.startswith("dm:") and key != f"dm:{PARTNER_USER_ID}":
+        return
+    _dirty_history_buckets.add(key)
 
 
 def spawn_bg(coro, *, name: str = "bg"):

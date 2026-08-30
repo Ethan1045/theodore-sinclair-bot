@@ -29,6 +29,7 @@ KEYWORD_STATUS_MAP: list[tuple] = [
     (("书", "读书", "阅读", "看书", "图书馆"),       "playing",   "Reading. Do not disturb."),
     (("猎鹰", "falcon"),                             "playing",   "Falconry grounds"),
     (("日内瓦", "巴黎", "出差", "飞机", "机场"),     "watching",  "Somewhere over Europe"),
+    (("毕设", "实验", "化学", "论文"),               "watching",  "Thinking of her lab notes"),
 ]
 
 _TYPE_MAP = {
@@ -73,6 +74,10 @@ async def apply_presence(kind: str, text: str, *, source: str) -> bool:
 
 
 async def try_explicit_activity_sync(text: str) -> None:
+    # The persistent day plan is the source of truth; ad-hoc keyword changes
+    # would make the avatar disagree with reply/proactive context.
+    if state.current_life_slot:
+        return
     if not text or not _presence_cooldown_ok():
         return
     m = _EXPLICIT_ACTIVITY_RE.search(text)
@@ -88,6 +93,8 @@ async def try_explicit_activity_sync(text: str) -> None:
 
 
 async def try_keyword_presence_update(text: str) -> None:
+    if state.current_life_slot:
+        return
     if random.random() > 0.35:
         return
     if not _presence_cooldown_ok():
@@ -99,23 +106,32 @@ async def try_keyword_presence_update(text: str) -> None:
             return
 
 
-async def generate_presence() -> tuple[str, discord.ActivityType]:
-    from config import get_beijing_time_note
-    time_ctx = get_beijing_time_note()
+async def generate_presence() -> tuple[str, discord.ActivityType, str]:
+    from config import get_presence_time_context
+    time_ctx = get_presence_time_context()
     prompt = (
         f"{time_ctx}\n"
-        "你需要为T.S.（Theodore Sinclair / 沈玘言）生成一条Discord在线状态。\n"
-        "状态格式为『正在听 xxx』『正在玩 xxx』『正在看 xxx』，显示在头像旁边。\n\n"
-        "【规则】\n"
-        "1. 根据当前时间推断他可能在做什么，自由发挥，不要总重复同一类型\n"
-        "2. listening → 一首真实歌曲/专辑/艺术家\n"
-        "3. playing → 他正在做的一件具体的事\n"
-        "4. watching → 他在注视/关注某件事\n"
-        "5. 鼓励生成意想不到但仍符合人设的组合，不要每次都选同一类型\n"
-        "6. 状态文字最多20个字符，不加引号，不解释\n\n"
-        "输出格式（严格只输出一行）：TYPE|TEXT\n"
-        "TYPE 是 listening / playing / watching 之一。\n"
-        "现在输出："
+        "Generate a Discord status for T.S. (Theodore Sinclair / 沈玘言), a 32-year-old Anglo-Chinese man living in London.\n"
+        "The status appears next to his avatar as 'Listening to xxx' / 'Playing xxx' / 'Watching xxx'.\n\n"
+        "【Rules】\n"
+        "1. Base the activity on HIS London local time — what would he plausibly be doing right now?\n"
+        "1a. His temperament is consistently gentle, composed, restrained, highly capable and well-mannered. The status must fit his established life: family-office work, foundation governance, archival/book conservation, serious reading, fencing, swimming, riding, tea, restrained music listening or quiet travel.\n"
+        "1b. Do not invent quirky habits, comic incompetence, flippant thoughts, internet slang, attention-seeking moods, melodrama or random contrast for 'human realism'. Never make him look unserious or out of character.\n"
+        "2. listening → a real song / album / artist\n"
+        "3. playing → a specific thing he's doing\n"
+        "4. watching → something he's observing or paying attention to\n"
+        "5. Vary the type — don't always pick the same category\n"
+        "6. Status text: max 25 characters, no quotes, no explanation\n"
+        "7. Language: mostly English (about 70-80%), occasionally Chinese or mixed\n"
+        "8. Duration: classify the status as 'instant' or 'sustained':\n"
+        "   - instant: brief/momentary actions (adjusting cufflinks, checking the time, flipping a coin, glancing out the window)\n"
+        "   - sustained: ongoing activities (reading, listening to music, working on documents, fencing practice)\n\n"
+        "Output format (strictly one line): TYPE|DURATION|TEXT\n"
+        "TYPE = listening / playing / watching\n"
+        "DURATION = instant / sustained\n"
+        "Example: playing|instant|Adjusting cufflinks\n"
+        "Example: listening|sustained|Chet Baker - Almost Blue\n"
+        "Now output:"
     )
     try:
         response = await ai_chat_create(
@@ -129,16 +145,25 @@ async def generate_presence() -> tuple[str, discord.ActivityType]:
         raw = raw.splitlines()[0].strip()
         if "|" not in raw:
             raise ValueError(f"格式错误: {raw}")
-        type_str, text = raw.split("|", 1)
-        type_str = type_str.strip().lower()
-        text = text.strip()[:128]
+        parts = raw.split("|")
+        if len(parts) >= 3:
+            type_str = parts[0].strip().lower()
+            duration_type = parts[1].strip().lower()
+            text = "|".join(parts[2:]).strip()[:128]
+        else:
+            type_str = parts[0].strip().lower()
+            duration_type = "sustained"
+            text = parts[1].strip()[:128]
+
+        if duration_type not in ("instant", "sustained"):
+            duration_type = "sustained"
 
         if text in state._recent_presences:
             fallback_texts = [
-                "Restoring a 19th c. spine", "Quietly bullying spreadsheets",
+                "Restoring a 19th c. spine", "Reviewing family-office papers",
                 "Window light on old paper", "Late letters to Geneva",
-                "Listening for your typing", "Re-shelving first editions",
-                "Adjusting cufflinks again", "Watching London fog collect",
+                "Chet Baker in the study", "Re-shelving first editions",
+                "Foundation papers", "Watching London fog collect",
             ]
             unused = [t for t in fallback_texts if t not in state._recent_presences]
             text = random.choice(unused or fallback_texts)
@@ -153,42 +178,45 @@ async def generate_presence() -> tuple[str, discord.ActivityType]:
             "watching": discord.ActivityType.watching,
         }
         activity_type = type_map.get(type_str, discord.ActivityType.playing)
-        print(f"🎭 AI生成状态: [{type_str}] {text}")
-        return text, activity_type
+        print(f"🎭 AI生成状态: [{type_str}|{duration_type}] {text}")
+        return text, activity_type, duration_type
     except Exception as e:
         print(f"AI生成状态失败，使用fallback: {e}")
         fallbacks = [
-            ("Manuscript restoration", discord.ActivityType.playing),
-            ("Chet Baker - Almost Blue", discord.ActivityType.listening),
-            ("Reviewing filings", discord.ActivityType.playing),
-            ("Dusting the archive room", discord.ActivityType.playing),
+            ("Manuscript restoration", discord.ActivityType.playing, "sustained"),
+            ("Chet Baker - Almost Blue", discord.ActivityType.listening, "sustained"),
+            ("Reviewing filings", discord.ActivityType.playing, "sustained"),
+            ("Dusting the archive room", discord.ActivityType.playing, "sustained"),
         ]
-        text, activity_type = random.choice(fallbacks)
+        text, activity_type, dur = random.choice(fallbacks)
         if text not in state._recent_presences:
             state._recent_presences.append(text)
             if len(state._recent_presences) > 10:
                 state._recent_presences = state._recent_presences[-10:]
-        return text, activity_type
+        return text, activity_type, dur
 
 
 async def generate_custom_bubble() -> str:
-    from config import get_beijing_time_note
-    time_ctx = get_beijing_time_note()
-    recent_str = "、".join(state._recent_presences[-5:]) if state._recent_presences else "无"
+    from config import get_presence_time_context
+    time_ctx = get_presence_time_context()
+    recent_str = ", ".join(state._recent_presences[-5:]) if state._recent_presences else "none"
 
     prompt = (
         f"{time_ctx}\n"
-        "你需要为T.S.（Theodore Sinclair / 沈玘言）生成一条Discord自定义状态气泡文字。\n"
-        "这条文字会显示在他头像旁边的气泡里，像一个真实的人随手更新的状态。\n\n"
-        "【内容方向（随机选一个）】\n"
-        "- 脑子里的随机碎碎念（很短，像自言自语）\n"
-        "- 当前天气 + 感受\n"
-        "- 当下做的具体小事\n"
-        "- 莫名其妙的一句话，但符合他的气质\n\n"
-        "【禁止】励志体、鸡汤体、营销感\n"
-        "- 重复最近用过的内容：" + recent_str + "\n\n"
-        "【格式】严格不超过40个字符，越短越好，只输出一行状态文字\n\n"
-        "现在输出："
+        "Generate a Discord custom status bubble for T.S. (Theodore Sinclair / 沈玘言), "
+        "a 32-year-old Anglo-Chinese man living in London.\n"
+        "This text appears in a bubble next to his avatar, like a real person's casual status update.\n\n"
+        "【Direction (pick one randomly)】\n"
+        "- A random thought in his head (very short, like talking to himself)\n"
+        "- Weather + feeling about it\n"
+        "- A small thing he's doing right now\n"
+        "- A cryptic one-liner that fits his vibe\n\n"
+        "【Language】Mostly English (70-80%), occasionally Chinese or mixed. He's half-British half-Chinese.\n"
+        "【Time】Base it on his London local time, not Beijing time.\n"
+        "【Forbidden】Motivational quotes, saccharine tone, marketing-speak\n"
+        "- Don't repeat recent statuses: " + recent_str + "\n\n"
+        "【Format】Max 40 characters, shorter is better, output exactly one line.\n\n"
+        "Now output:"
     )
 
     fallbacks = [
@@ -203,7 +231,7 @@ async def generate_custom_bubble() -> str:
             model=config.MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=512,
-            temperature=1.3,
+            temperature=0.9,
         )
         raw = response.choices[0].message.content.strip().splitlines()[0]
         raw = raw.strip('"\'「」“”‘’')
@@ -256,5 +284,20 @@ def get_guild_emoji_hint(guild: "discord.Guild | None") -> str:
     return (
         "\n\n【本服务器的自定义表情】你可以在聊天文本里直接使用下列自定义表情（复制粘贴整个尖括号标签即可），"
         "它们会在Discord里正确渲染成表情图片。不要滥用，只在真正合适时用一个。\n"
+        + "\n".join(lines)
+    )
+
+
+def get_guild_sticker_hint(guild: "discord.Guild | None") -> str:
+    """Expose only stickers the bot can actually send in the current guild."""
+    if not guild:
+        return ""
+    stickers = [s for s in guild.stickers if getattr(s, "available", True)]
+    if not stickers:
+        return ""
+    lines = [f"- {s.name}（sticker_id={s.id}）" for s in stickers[:20]]
+    return (
+        "\n\n【本服务器贴纸】极少数时候，你可以不发正文、只用一个服务器贴纸回应。"
+        "仅可从下列清单选择，并输出 SEND_STICKER 动作；不要臆造ID，也不要与文字表情同时滥用。\n"
         + "\n".join(lines)
     )

@@ -5,7 +5,7 @@ from urllib.parse import quote_plus
 
 _COT_OPENERS = (
     "let's", "let me", "i'll ", "i will ", "my response", "my reply",
-    "the user", "user's message", "this is a",
+    "the user", "partner's message", "partner is", "this is a",
     "i should", "i need to", "i want to", "first,", "step 1",
     "okay,", "alright,", "options:", "plan:", "thinking:",
     "draft:", "considering", "analysis:", "breakdown:",
@@ -109,17 +109,20 @@ def parse_bot_directives(raw_bot_reply: str):
     - action_matches: [ACTION]...[/ACTION] 的 JSON 字符串列表
     """
     # 强力清除思维链与裸 CoT 段落
+    original = raw_bot_reply
     raw_bot_reply = _strip_cot_preamble(raw_bot_reply)
+    if not raw_bot_reply.strip():
+        raw_bot_reply = original
 
     reaction_match = re.search(r'\[REACTION:(.*?)\]', raw_bot_reply, re.DOTALL)
     emojis_to_react = []
-    reaction_target = "SELF"
+    reaction_target = "USER"
     if reaction_match:
         raw_emojis = reaction_match.group(1).strip()
         if raw_emojis.upper() != "NONE":
             parts_r = [p.strip() for p in raw_emojis.split(',')]
             if parts_r:
-                reaction_target = (parts_r[0] or "SELF").upper()
+                reaction_target = (parts_r[0] or "USER").upper()
                 emojis_to_react = [e for e in parts_r[1:] if e]
 
     action_matches = re.findall(r'\[ACTION\](.*?)\[/ACTION\]', raw_bot_reply, re.DOTALL)
@@ -166,16 +169,32 @@ def _resolve_link_directive(kind: str, query: str) -> str | None:
     k = (kind or "").strip().lower()
     if k in ("music", "song", "spotify"):
         return f"https://open.spotify.com/search/{qenc}"
-    if k in ("youtube", "yt", "mv"):
+    if k in ("apple", "applemusic", "am"):
+        return f"https://music.apple.com/search?term={qenc}"
+    if k in ("ytmusic", "youtubemusic"):
+        return f"https://music.youtube.com/search?q={qenc}"
+    if k in ("youtube", "yt", "mv", "video"):
         return f"https://www.youtube.com/results?search_query={qenc}"
+    if k in ("bilibili", "b站", "bili"):
+        return f"https://search.bilibili.com/all?keyword={qenc}"
     if k in ("book", "books"):
         return f"https://www.google.com/search?tbm=bks&q={qenc}"
+    if k in ("douban", "豆瓣"):
+        return f"https://www.douban.com/search?q={qenc}"
     if k in ("wiki", "wikipedia"):
         return f"https://zh.wikipedia.org/wiki/Special:Search?search={qenc}"
+    if k in ("enwiki",):
+        return f"https://en.wikipedia.org/wiki/Special:Search?search={qenc}"
     if k in ("web", "search", "google"):
         return f"https://www.google.com/search?q={qenc}"
     if k in ("map", "maps"):
         return f"https://www.google.com/maps/search/{qenc}"
+    if k in ("steam", "game", "games"):
+        return f"https://store.steampowered.com/search/?term={qenc}"
+    if k in ("imdb",):
+        return f"https://www.imdb.com/find/?q={qenc}"
+    if k in ("github", "gh"):
+        return f"https://github.com/search?q={qenc}"
     return None
 
 

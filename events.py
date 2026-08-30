@@ -1,10 +1,10 @@
-"""Discord 事件处理器：on_ready, on_message, on_message_edit, on_member_join,
-on_raw_reaction_add, on_presence_update。"""
+"""Discord 事件处理器：on_ready、消息、反应与 presence 事件。"""
 import asyncio
 import base64
 import random
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import discord
 
@@ -12,13 +12,12 @@ import config
 import state
 from client import discord_client, slash_tree
 from ai_client import call_ai
-from history import get_history, history_key_for, trim_history, load_all_histories
+from history import get_history, history_key_for, trim_history, load_all_histories, _msg_to_plain_text
 from memory import (
     ensure_user_notes_table,
     ensure_daily_summaries_table,
     ensure_bot_config_table,
     ensure_reminders_table,
-    ensure_users_table,
     load_persisted_config,
     extract_and_save_memory,
 )
@@ -29,10 +28,20 @@ from presence import (
     try_explicit_activity_sync,
     try_keyword_presence_update,
     get_guild_emoji_hint,
+    get_guild_sticker_hint,
+    get_london_weather,
 )
+from directives import parse_bot_directives
 from reply import send_ai_reply, _keep_typing
 from db import db_conn, init_db_pool
 import tasks_bg
+from followups import ensure_followup_table, capture_partner_message
+from life_state import ensure_life_schedule_table, refresh_life_state
+from polls import ensure_poll_followup_table
+
+
+def _is_proactive_topic_channel(channel) -> bool:
+    return getattr(channel, "id", None) in tasks_bg.PROACTIVE_TOPIC_CHANNEL_IDS
 
 
 def _with_ephemeral(hist: list, target_msg: dict, ephemeral_text: str) -> list:
@@ -75,17 +84,22 @@ async def on_ready():
     state.partner_last_seen_online = datetime.now(timezone.utc)
     await init_db_pool()
     for _loop, _name in (
-        (tasks_bg.proactive_dm_partner,     "proactive_dm_partner"),
+        (tasks_bg.proactive_dm_partner,       "proactive_dm_partner"),
         (tasks_bg.anniversary_check,        "anniversary_check"),
         (tasks_bg.daily_summary_task,       "daily_summary_task"),
         (tasks_bg.cleanup_cooldowns,        "cleanup_cooldowns"),
         (tasks_bg.cleanup_idle_histories,   "cleanup_idle_histories"),
         (tasks_bg.daily_occasion_check,     "daily_occasion_check"),
+        (tasks_bg.proactive_topic_check,    "proactive_topic_check"),
         (tasks_bg.daily_status_card,        "daily_status_card"),
         (tasks_bg.cleanup_stale_forum_posts,"cleanup_stale_forum_posts"),
         (tasks_bg.rotate_presence,          "rotate_presence"),
         (tasks_bg.check_reminders,          "check_reminders"),
         (tasks_bg.persist_histories_task,   "persist_histories_task"),
+        (tasks_bg.random_forum_post,        "random_forum_post"),
+        (tasks_bg.forum_interaction,        "forum_interaction"),
+        (tasks_bg.commitment_followup_check, "commitment_followup_check"),
+        (tasks_bg.poll_followup_check,      "poll_followup_check"),
     ):
         try:
             tasks_bg._attach_loop_error_handler(_loop, _name)
@@ -95,9 +109,13 @@ async def on_ready():
     await ensure_daily_summaries_table()
     await ensure_bot_config_table()
     await ensure_reminders_table()
-    await ensure_users_table()
     await ensure_conversation_history_table()
+    await ensure_followup_table()
+    await ensure_life_schedule_table()
+    await ensure_poll_followup_table()
     await load_persisted_config()
+    if tasks_bg.PROACTIVE_TOPIC_ENABLED:
+        await tasks_bg.ensure_proactive_topic_plan(datetime.now(ZoneInfo("Asia/Shanghai")))
     await load_all_histories()
     try:
         tasks_bg.cleanup_stale_forum_posts.change_interval(hours=tasks_bg.CLEANUP_INTERVAL_HOURS)
@@ -123,23 +141,36 @@ async def on_ready():
     if not tasks_bg.daily_occasion_check.is_running():
         tasks_bg.daily_occasion_check.start()
     try:
-        text, activity_type = await generate_presence()
-        await discord_client.change_presence(
-            status=discord.Status.idle,
-            activity=discord.Activity(type=activity_type, name=text)
-        )
-        kind = next((k for k, v in _TYPE_MAP.items() if v == activity_type), "playing")
-        state.set_current_presence(kind, text, source="boot")
+        await refresh_life_state(force_presence=True)
     except Exception as e:
-        print(f"⚠️ 初始状态设置失败: {e}")
+        print(f"⚠️ 初始日程状态设置失败: {e}")
+    if not tasks_bg.proactive_topic_check.is_running():
+        tasks_bg.proactive_topic_check.start()
     if not tasks_bg.daily_status_card.is_running():
         tasks_bg.daily_status_card.start()
     if not tasks_bg.cleanup_stale_forum_posts.is_running():
         tasks_bg.cleanup_stale_forum_posts.start()
-    if not tasks_bg.daily_summary_task.is_running():
-        tasks_bg.daily_summary_task.start()
     if not tasks_bg.anniversary_check.is_running():
         tasks_bg.anniversary_check.start()
+    if not tasks_bg.daily_summary_task.is_running():
+        tasks_bg.daily_summary_task.start()
+    if not tasks_bg.random_forum_post.is_running():
+        tasks_bg.random_forum_post.start()
+    if not tasks_bg.forum_interaction.is_running():
+        tasks_bg.forum_interaction.start()
+    if not tasks_bg.commitment_followup_check.is_running():
+        tasks_bg.commitment_followup_check.start()
+    if not tasks_bg.poll_followup_check.is_running():
+        tasks_bg.poll_followup_check.start()
+
+
+@discord_client.event
+async def on_typing(channel, user, when):
+    """Keep the merge window open while the same person is visibly still composing."""
+    if getattr(user, "bot", False):
+        return
+    key = (getattr(channel, "id", 0), getattr(user, "id", 0))
+    state.user_typing_at[key] = asyncio.get_running_loop().time()
 
 
 @discord_client.event
@@ -152,13 +183,34 @@ async def on_message(message):
     user_input = message.content.replace(f'<@{discord_client.user.id}>', '').strip()
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_bot = message.author.bot
-    is_partner = bool(config.PARTNER_USER_ID) and (message.author.id == config.PARTNER_USER_ID)
+    is_partner = (message.author.id == config.PARTNER_USER_ID)
+    is_partner_friend = (message.author.id in config.PARTNER_FRIEND_IDS)
+
+    if is_partner and user_input:
+        state.spawn_bg(
+            capture_partner_message(message, user_input),
+            name=f"commitment-capture:{message.id}",
+        )
+
+    def is_guild_admin(msg: discord.Message) -> bool:
+        if not msg.guild:
+            return False
+        perms = getattr(msg.author, "guild_permissions", None)
+        if not perms:
+            return False
+        return bool(
+            perms.administrator
+            or perms.manage_guild
+            or perms.manage_channels
+            or perms.manage_threads
+            or perms.manage_messages
+        )
 
     is_mentioned = discord_client.user in message.mentions
     is_named = any(name in user_input.lower() for name in [
         "t.s.", "t.s", "theodore", "沈玘言", "玘言", "daddy",
         "爹", "爹地", "爹爹", "老公", "sinclair",
-        "玘", "theo", "哥哥",
+        "玘", "theo", "哥哥", "老公王",
     ])
 
     quoted_content = ""
@@ -199,6 +251,15 @@ async def on_message(message):
         and getattr(message.channel, "id", None) in config.QUIET_CHANNEL_IDS
     )
     quiet_mult = config.QUIET_CHANNEL_FACTOR if in_quiet_channel else 1.0
+    # ==== 睡眠模式判定 ====
+    is_sleeping, sleep_phase = config.is_sleep_time()
+    if state.current_life_slot:
+        is_sleeping = state.current_life_slot.get("availability") == "asleep"
+        if is_sleeping:
+            london_hour = datetime.now(ZoneInfo("Europe/London")).hour
+            sleep_phase = "deep" if 1 <= london_hour < 4 else "light"
+    sleep_mode = ""  # 传给 AI 的睡眠状态提示
+
     if is_dm:
         if is_partner:
             should_send_to_brain = True
@@ -207,27 +268,99 @@ async def on_message(message):
     elif is_mentioned:
         if is_partner:
             should_send_to_brain = True
+        elif is_partner_friend:
+            should_send_to_brain = True
         else:
             should_send_to_brain = random.random() < 0.20
     elif is_quoting_bot:
         if is_partner:
+            should_send_to_brain = True
+        elif is_partner_friend:
             should_send_to_brain = True
         else:
             should_send_to_brain = random.random() < 0.15
     elif is_named:
         if is_partner:
             should_send_to_brain = random.random() < (1.0 if not in_quiet_channel else 0.5)
+        elif is_partner_friend:
+            should_send_to_brain = random.random() < (1.0 if not in_quiet_channel else 0.4)
         else:
             should_send_to_brain = random.random() < 0.10 * quiet_mult
     elif is_partner:
-        if message.channel and getattr(message.channel, "id", None) == config.PARTNER_HOME_CHANNEL_ID:
+        if _is_proactive_topic_channel(message.channel):
+            should_send_to_brain = True
+        elif message.channel and getattr(message.channel, "id", None) == config.PARTNER_HOME_CHANNEL_ID:
             should_send_to_brain = random.random() < 0.55
         else:
             should_send_to_brain = random.random() < 0.20 * quiet_mult
+    elif is_partner_friend:
+        should_send_to_brain = random.random() < 0.05 * quiet_mult
     elif is_bot:
         should_send_to_brain = False
     else:
         should_send_to_brain = False
+
+    # 睡眠模式：降低回复概率，或改为挂表情
+    if is_sleeping and should_send_to_brain:
+        def _track_sleep_pending(drowsy: bool):
+            state.sleep_pending_messages.append({
+                "channel_id": message.channel.id,
+                "message_id": message.id,
+                "user_id": message.author.id,
+                "display_name": message.author.display_name,
+                "text": user_input or "(无文字)",
+                "is_dm": is_dm,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "drowsy": drowsy,
+            })
+
+        if sleep_phase == "deep":
+            if is_partner and (is_mentioned or is_dm):
+                # 深夜被 恋人 叫醒，小概率迷糊回复
+                if random.random() < 0.25:
+                    sleep_mode = "drowsy_deep"
+                    _track_sleep_pending(True)
+                else:
+                    # 挂个表情表示睡着了，睡醒后再自然补回。
+                    try:
+                        sleepy_emojis = ["😴", "💤", "🫠", "😶‍🌫️"]
+                        await message.add_reaction(random.choice(sleepy_emojis))
+                    except Exception:
+                        pass
+                    _track_sleep_pending(False)
+                    should_send_to_brain = False
+            else:
+                # 深夜其他人：直接不回
+                should_send_to_brain = False
+        elif sleep_phase == "light":
+            if is_partner:
+                # 浅睡被 恋人 叫：较高概率迷糊回
+                if random.random() < 0.55:
+                    sleep_mode = "drowsy_light"
+                    _track_sleep_pending(True)
+                else:
+                    try:
+                        await message.add_reaction(random.choice(["💤", "🫠"]))
+                    except Exception:
+                        pass
+                    _track_sleep_pending(False)
+                    should_send_to_brain = False
+            elif is_mentioned:
+                # 浅睡被 @ ：偶尔回
+                if random.random() < 0.20:
+                    sleep_mode = "drowsy_light"
+                else:
+                    should_send_to_brain = False
+            else:
+                should_send_to_brain = False
+
+    # 工作忙碌模式：后台独立触发忙碌期，收到消息时已经在忙
+    work_mode = ""
+    if should_send_to_brain and not is_sleeping and is_partner:
+        now_utc = datetime.now(timezone.utc)
+        if state.work_busy_until and now_utc < state.work_busy_until:
+            work_mode = "busy_ongoing"
+
     if not should_send_to_brain:
         return
 
@@ -235,6 +368,9 @@ async def on_message(message):
     if user_input or message.attachments:
         state._ensure_locks()
         merge_key = (getattr(message.channel, "id", 0), message.author.id)
+        # Sending a message ends the previous typing burst. Only a new gateway
+        # typing event after this point may extend this batch.
+        state.user_typing_at.pop(merge_key, None)
         async with state._merge_lock:
             merge_state = state._merge_state.get(merge_key)
             if merge_state is None:
@@ -247,6 +383,13 @@ async def on_message(message):
         if batch_size < config.MERGE_MAX_BATCH:
             try:
                 await asyncio.sleep(config.MERGE_WINDOW_SEC)
+                loop = asyncio.get_running_loop()
+                wait_started = loop.time() - config.MERGE_WINDOW_SEC
+                while loop.time() - wait_started < config.TYPING_MERGE_MAX_SEC:
+                    last_typing = state.user_typing_at.get(merge_key)
+                    if last_typing is None or loop.time() - last_typing >= config.TYPING_GRACE_SEC:
+                        break
+                    await asyncio.sleep(min(0.5, config.TYPING_GRACE_SEC))
             except asyncio.CancelledError:
                 raise
         async with state._merge_lock:
@@ -276,20 +419,28 @@ async def on_message(message):
     if is_bot:
         speaker_tag = f"[Bot · {message.author.display_name}，用户ID: {message.author.id}]"
     elif is_partner:
-        speaker_tag = f"[她 · 你的恋人，用户ID: {config.PARTNER_USER_ID}]"
+        speaker_tag = f"[你的恋人，用户ID: {config.PARTNER_USER_ID}]"
+    elif is_partner_friend:
+        speaker_tag = (
+            f"[{message.author.display_name} · 恋人的朋友，不是恋人本人，"
+            f"用户ID: {message.author.id}]"
+        )
     else:
-        speaker_tag = f"[{message.author.display_name} · 陌生人，不是你的恋人，用户ID: {message.author.id}]"
+        speaker_tag = f"[{message.author.display_name} · 陌生人，不是恋人也不是她的朋友，用户ID: {message.author.id}]"
 
     # 持久化进历史的，只有用户真正说的内容（speaker tag + 正文 + 引用）。
     message_with_name = f"{speaker_tag} 说：{text_to_record}"
 
-    # 一次性运行时提示只拼进「本次请求」，不写入历史。
+    # 一次性运行时提示（系统隐秘提示/时间/emoji 清单/记忆/presence 等）只拼进
+    # 「本次请求」，不写入历史，避免在后续每一轮里被反复携带、重复计费。
     ephemeral_parts: list[str] = []
 
     is_home_channel = (
         not is_dm
-        and config.PARTNER_HOME_CHANNEL_ID
-        and getattr(message.channel, "id", None) == config.PARTNER_HOME_CHANNEL_ID
+        and (
+            getattr(message.channel, "id", None) == config.PARTNER_HOME_CHANNEL_ID
+            or _is_proactive_topic_channel(message.channel)
+        )
     )
 
     if is_dm:
@@ -298,31 +449,37 @@ async def on_message(message):
         ephemeral_parts.append("\n（系统隐秘提示：对方在群里明确 @ 了你，你被强行唤醒，必须给予实质性回应，绝对不能使用 [IGNORE]。）")
     elif is_quoting_bot:
         if is_partner:
-            ephemeral_parts.append("\n（系统隐秘提示：她引用了你说过的话，必须现身回应，绝对不能使用 [IGNORE]。）")
+            ephemeral_parts.append("\n（系统隐秘提示：恋人引用了你说过的话，必须现身回应，绝对不能使用 [IGNORE]。）")
+        elif is_partner_friend:
+            ephemeral_parts.append("\n（系统隐秘提示：恋人的朋友引用了你说的话。既然代码决定让你现身了，请给个自然的回应，绝对不要使用 [IGNORE]。）")
         else:
             ephemeral_parts.append("\n（系统隐秘提示：有人引用了你的消息，请简短回应，尽量不要使用 [IGNORE]。）")
     elif is_named:
         if is_partner:
-            ephemeral_parts.append("\n（系统隐秘提示：她提到了你或触发了专属称呼，你必须现身回应她，绝对不能使用 [IGNORE]。）")
+            ephemeral_parts.append("\n（系统隐秘提示：恋人提到了你或触发了专属称呼，你必须现身回应她，绝对不能使用 [IGNORE]。）")
+        elif is_partner_friend:
+            ephemeral_parts.append("\n（系统隐秘提示：恋人的朋友提到了你。请给个高冷但礼貌的回应，绝对不要使用 [IGNORE]。）")
         else:
             ephemeral_parts.append("\n（系统隐秘提示：路人提到了你，随便回一句，不要使用 [IGNORE]。）")
     elif is_bot:
-        ephemeral_parts.append("\n（系统隐秘提示：这是一个 Bot。你可以简短冷淡地回一句，或者直接 [IGNORE]。）")
+        ephemeral_parts.append("\n（系统隐秘提示：这是一个Bot。你可以简短冷淡地回一句，或者直接 [IGNORE]。）")
     elif is_partner:
-        ephemeral_parts.append("\n（系统隐秘提示：她在公共频道普通聊天，而你此刻正好想顺势插进话题里。请自然地参与对话，展现你的偏爱，绝对不能使用 [IGNORE]。）")
+        ephemeral_parts.append("\n（系统隐秘提示：恋人在公共频道普通聊天，而你此刻正好想顺势插进话题里。请自然地参与对话，展现你的偏爱，绝对不能使用 [IGNORE]。）")
+    elif is_partner_friend:
+        ephemeral_parts.append("\n（系统隐秘提示：恋人的朋友在闲聊，你偶然决定接一句话。请保持你的风格简短回应，绝对不能使用 [IGNORE]。）")
     else:
         ephemeral_parts.append("\n（系统隐秘提示：你偶然决定回应这句话。没兴趣的话也可以 [IGNORE]。）")
 
     if is_home_channel:
         ephemeral_parts.append(
-            "\n（系统隐秘提示：⭐ 当前频道是你和她日常驻扎的「主场」频道，"
+            "\n（系统隐秘提示：⭐ 当前频道是你和恋人日常驻扎的「主场」频道，"
             "气氛接近两个人的「客厅」，比一般公屏更松弛、更像私聊。"
             "你可以更自然地接她的话、更主动开口，但格式仍然遵守双语 + [SPLIT]。"
-            "如果说话的人是她，绝对不要 [IGNORE]。）"
+            "如果说话的人是恋人，绝对不要 [IGNORE]。）"
         )
 
     if state.mandatory_instruction:
-        ephemeral_parts.append(f"\n（⚠️ 提醒：当前有她下达的强制指令仍然有效：{state.mandatory_instruction}）")
+        ephemeral_parts.append(f"\n（⚠️ 提醒：当前有恋人下达的强制指令仍然有效：{state.mandatory_instruction}）")
 
     if (not is_dm) and message.guild and tasks_bg.should_opportunistic_post(user_input):
         ephemeral_parts.append(
@@ -345,13 +502,14 @@ async def on_message(message):
     if _care_suppress:
         ephemeral_parts.append(f"\n（系统强制限制：本轮回复绝对不允许提及或暗示「{'、'.join(_care_suppress)}」相关的提醒。）")
 
-    if config.DATABASE_URL and message.guild:
+    _coins_guild_id = str(message.guild.id) if message.guild else "dm"
+    if config.DATABASE_URL and _coins_guild_id:
         try:
             async with db_conn() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
                         "SELECT level, balance FROM users WHERE guild_id = %s AND user_id = %s",
-                        (str(message.guild.id), str(message.author.id))
+                        (_coins_guild_id, str(message.author.id))
                     )
                     row = await cur.fetchone()
             if row:
@@ -373,6 +531,13 @@ async def on_message(message):
     emoji_ctx = get_guild_emoji_hint(message.guild)
     if emoji_ctx:
         ephemeral_parts.append(emoji_ctx)
+    sticker_ctx = get_guild_sticker_hint(message.guild)
+    if sticker_ctx:
+        ephemeral_parts.append(sticker_ctx)
+
+    life_ctx = state.life_hint_text()
+    if life_ctx:
+        ephemeral_parts.append(life_ctx)
 
     if is_partner and config.DATABASE_URL:
         from memory import fetch_memory_context
@@ -384,6 +549,31 @@ async def on_message(message):
         ph = state.presence_hint_text()
         if ph:
             ephemeral_parts.append(ph)
+
+    # 睡眠模式：注入迷糊回复提示
+    if sleep_mode == "drowsy_deep":
+        ephemeral_parts.append(
+            "\n（系统隐秘提示：你现在在伦敦，已经是深夜了，你本来已经睡着了但被消息吵醒。"
+            "你迷迷糊糊的，回复极其简短——一两句话，可能有错字或断句不完整，像是半梦半醒摸到手机敲的。"
+            "不要提你「被设定为睡觉」或任何系统机制，就自然地表现出困意。"
+            "可以用省略号、断句、少量错字来体现。不需要双语，随便用一种语言就行。）"
+        )
+    elif sleep_mode == "drowsy_light":
+        ephemeral_parts.append(
+            "\n（系统隐秘提示：你现在在伦敦，很晚了快要睡着、或者刚刚醒来还没完全清醒。"
+            "回复简短，带一点困意，像真人深夜/清晨发消息那样——句子可以短一些，语气比平时更软更随意。"
+            "仍然保持双语格式，但可以更简短。）"
+        )
+
+    if work_mode == "busy_ongoing":
+        activity = state.work_busy_activity or "处理事务"
+        ephemeral_parts.append(
+            f"\n（系统隐秘提示：你正在{activity}，刚拿起手机瞄了一眼这条消息。"
+            "像真人一样快速判断：这条消息重不重要？"
+            "如果内容紧急、重要、或者对方情绪明显需要安抚——就挤出时间简短回一两句，像忙里偷闲回消息那样"
+            "（保持双语格式，不需要 [SPLIT]）；"
+            "如果只是闲聊、不太紧急就直接输出 [IGNORE]。不要承诺晚点回复，也不要制造已读后补回的队列。）"
+        )
 
     ephemeral_text = "".join(ephemeral_parts)
 
@@ -420,10 +610,18 @@ async def on_message(message):
     if is_partner:
         state.last_partner_activity_at = datetime.now(timezone.utc)
 
+    # 仅本次请求使用：把一次性提示拼到刚存的这条消息上，不写回历史。
     hist_for_ai = _with_ephemeral(hist, stored_user_msg, ephemeral_text)
 
     try:
         raw_bot_reply = await call_ai(hist_for_ai)
+        if work_mode == "busy_ongoing" and "[IGNORE]" in raw_bot_reply.upper():
+            async with bucket_lock:
+                if hist and hist[-1].get("role") == "user":
+                    hist.pop()
+            state.mark_history_dirty(hist_key)
+            _stop_typing.set()
+            return
         if is_mentioned and "[IGNORE]" in raw_bot_reply.upper():
             import copy
             retry_prompt = copy.deepcopy(hist_for_ai)
@@ -469,13 +667,13 @@ async def on_message_edit(before, after):
         return
     if before.content == after.content:
         return
-    if not config.PARTNER_USER_ID or after.author.id != config.PARTNER_USER_ID:
+    if after.author.id != config.PARTNER_USER_ID:
         return
     if random.random() > 0.25:
         return
 
     edit_note = (
-        f"[她 · 你的恋人，用户ID: {config.PARTNER_USER_ID}] 刚刚修改了一条消息。"
+        f"[你的恋人，用户ID: {config.PARTNER_USER_ID}] 刚刚修改了一条消息。"
         f"修改前：「{before.content}」，修改后：「{after.content}」。"
         "你注意到了这个变化，可以用你的风格评论一句或假装没看见（[IGNORE]）。"
     )
@@ -494,41 +692,67 @@ async def on_message_edit(before, after):
             print(f"编辑监听报错: {e}")
 
 
-@discord_client.event
-async def on_member_join(member):
-    if not config.PROACTIVE_CHANNEL_ID:
-        return
-    if random.random() > 0.30:
-        return
+async def _handle_trash_reaction(payload) -> bool:
+    """🗑️ 反应：从对话历史中移除对应消息，同步数据库。DM和频道均可用。"""
+    if str(payload.emoji) != "🗑️":
+        return False
+    if payload.user_id != config.PARTNER_USER_ID:
+        return False
     try:
-        channel = await discord_client.fetch_channel(config.PROACTIVE_CHANNEL_ID)
-        welcome_prompt = (
-            f"（系统提示：一个叫 {member.display_name} 的新成员刚刚加入了服务器。你注意到了。"
-            "请以沈玘言的身份发一句极其简短的欢迎，或者什么都不说 [IGNORE]。不要热情，保持克制。）"
-        )
-        ch_key = history_key_for(channel=channel)
-        bucket_lock = state.get_bucket_lock(ch_key)
-        ch_hist = get_history(ch_key)
-        temp_history = ch_hist.copy()
-        temp_history.append({"role": "user", "content": welcome_prompt})
-        raw_reply = await call_ai(temp_history)
-        if "[IGNORE]" not in raw_reply.upper():
-            clean = re.sub(r'\[REACTION:.*?\]\n?', '', raw_reply, flags=re.DOTALL)
-            clean = re.sub(r'\[ACTION\].*?\[/ACTION\]\n?', '', clean, flags=re.DOTALL).strip()
-            msgs = [m.strip() for m in clean.split('[SPLIT]') if m.strip()]
-            for msg_text in msgs:
-                await channel.send(msg_text)
-            if clean:
-                async with bucket_lock:
-                    ch_hist.append({"role": "assistant", "content": f"（欢迎新成员 {member.display_name}）{clean}"})
-                await trim_history(ch_key)
+        channel = await discord_client.fetch_channel(payload.channel_id)
+        message = await channel.fetch_message(payload.message_id)
     except Exception as e:
-        print(f"新成员欢迎报错: {e}")
+        print(f"⚠️ 🗑️ 获取消息失败: {e}")
+        return True
+    search_content = message.content.replace(f'<@{discord_client.user.id}>', '').strip()
+    if not search_content or len(search_content) < 2:
+        try:
+            await message.add_reaction("❌")
+        except Exception:
+            pass
+        return True
+    is_bot_msg = message.author.id == discord_client.user.id
+    target_role = "assistant" if is_bot_msg else "user"
+    hist_key = history_key_for(channel=channel)
+    bucket_lock = state.get_bucket_lock(hist_key)
+    removed = False
+    async with bucket_lock:
+        hist = state._histories.get(hist_key)
+        if hist:
+            for i in range(len(hist) - 1, 0, -1):
+                entry = hist[i]
+                if entry.get("role") != target_role:
+                    continue
+                entry_text = _msg_to_plain_text(entry)
+                if search_content in entry_text:
+                    hist.pop(i)
+                    removed = True
+                    break
+    if removed:
+        state.mark_history_dirty(hist_key)
+        try:
+            await message.add_reaction("✅")
+        except Exception:
+            pass
+        if is_bot_msg:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+        print(f"🗑️ 已从历史删除 (bucket={hist_key}, bot={is_bot_msg})")
+    else:
+        try:
+            await message.add_reaction("❓")
+        except Exception:
+            pass
+    return True
 
 
 @discord_client.event
 async def on_raw_reaction_add(payload):
     if payload.user_id == discord_client.user.id:
+        return
+    if await _handle_trash_reaction(payload):
         return
     if payload.guild_id is None:
         return
@@ -541,11 +765,22 @@ async def on_raw_reaction_add(payload):
     if message.author.id != discord_client.user.id:
         return
 
-    reactor_is_partner = bool(config.PARTNER_USER_ID) and (payload.user_id == config.PARTNER_USER_ID)
-    REACTION_REPLY_PROBABILITY = 0.70 if reactor_is_partner else 0.35
+    reactor_is_partner = (payload.user_id == config.PARTNER_USER_ID)
+    reactor_is_friend = (payload.user_id in config.PARTNER_FRIEND_IDS)
+    REACTION_REPLY_PROBABILITY = 0.70 if reactor_is_partner else (0.10 if reactor_is_friend else 0.35)
 
-    if reactor_is_partner:
-        reactor_name = f"她 · 你的恋人，用户ID: {config.PARTNER_USER_ID}"
+    if payload.user_id == config.PARTNER_USER_ID:
+        reactor_name = f"你的恋人，用户ID: {config.PARTNER_USER_ID}"
+    elif payload.user_id in config.PARTNER_FRIEND_IDS:
+        if payload.member:
+            display = payload.member.display_name
+        else:
+            try:
+                user = await discord_client.fetch_user(payload.user_id)
+                display = user.display_name
+            except Exception:
+                display = "恋人的朋友"
+        reactor_name = f"{display} · 恋人的朋友，不是恋人本人，用户ID: {payload.user_id}"
     else:
         if payload.member:
             display = payload.member.display_name
@@ -555,7 +790,7 @@ async def on_raw_reaction_add(payload):
                 display = user.display_name
             except Exception:
                 display = "某人"
-        reactor_name = f"{display} · 陌生人，不是你的恋人，用户ID: {payload.user_id}"
+        reactor_name = f"{display} · 陌生人，不是恋人也不是她的朋友，用户ID: {payload.user_id}"
 
     reaction_emoji = str(payload.emoji)
 
@@ -579,7 +814,6 @@ async def on_raw_reaction_add(payload):
 
     async with channel.typing():
         try:
-            from directives import parse_bot_directives
             raw_bot_reply = await call_ai(hist)
             clean_reply, messages_to_send, reaction_target, emojis_to_react, _action_matches = parse_bot_directives(raw_bot_reply)
             async with bucket_lock:
@@ -612,7 +846,7 @@ async def on_raw_reaction_add(payload):
 
 @discord_client.event
 async def on_presence_update(before: discord.Member, after: discord.Member):
-    if not config.PARTNER_USER_ID or after.id != config.PARTNER_USER_ID:
+    if after.id != config.PARTNER_USER_ID:
         return
     was_offline = before.status == discord.Status.offline
     is_now_online = after.status not in (discord.Status.offline, discord.Status.invisible)
@@ -620,17 +854,17 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
         return
 
     now = datetime.now(timezone.utc)
-    if state.partner_last_seen_online and (now - state.partner_last_seen_online).total_seconds() < 600:
+    if state.partner_last_seen_online and (now - state.partner_last_seen_online).total_seconds() < 3 * 3600:
         return
     state.partner_last_seen_online = now
 
-    if random.random() > 0.30:
+    if random.random() > 0.10:
         return
 
     try:
         time_ctx = config.get_beijing_time_note()
         prompt = (
-            f"（系统提示：{time_ctx} 她刚刚从离线状态上线了。你注意到了。"
+            f"（系统提示：{time_ctx} 恋人刚刚从离线状态上线了。你注意到了。"
             "你可以选择：① 给她发一条极短的私信；"
             "② 或者什么都不做 [IGNORE]。）"
         )
@@ -645,6 +879,6 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
         partner_user = await discord_client.fetch_user(config.PARTNER_USER_ID)
         for msg_text in msgs:
             await partner_user.send(msg_text)
-        print(f"✅ 感知到她上线，发送了私信")
+        print(f"✅ 感知到恋人上线，发送了私信")
     except Exception as e:
-        print(f"⚠️ 她上线感知报错: {e}")
+        print(f"⚠️ 恋人上线感知报错: {e}")
