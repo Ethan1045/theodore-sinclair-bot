@@ -3,7 +3,7 @@ import asyncio
 import json as _json
 import re
 import traceback as _tb
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import discord
 
@@ -33,7 +33,7 @@ def short_action_context(trigger_message: discord.Message) -> str:
     )
 
 
-async def execute_action(action_json_str: str, trigger_message: discord.Message):
+async def execute_action(action_json_str: str, trigger_message: discord.Message, response_message: discord.Message | None = None):
     def extract_id(raw_val):
         if not raw_val:
             return None
@@ -187,6 +187,8 @@ async def execute_action(action_json_str: str, trigger_message: discord.Message)
             "PIN_MESSAGE", "UNPIN_MESSAGE",
             "ADD_COINS", "ADD_XP",
             "SEND_DM",
+            "SEND_STICKER", "EDIT_OWN_MESSAGE", "CREATE_POLL",
+            "FORWARD_MESSAGE", "CREATE_SCHEDULED_EVENT",
         }
         if action_type in DESTRUCTIVE_ACTIONS:
             requester = getattr(trigger_message, "author", None)
@@ -212,6 +214,11 @@ async def execute_action(action_json_str: str, trigger_message: discord.Message)
 
         raw_channel_id = data.get("channel_id")
         channel_id = extract_id(raw_channel_id) if extract_id(raw_channel_id) else trigger_message.channel.id
+
+        if action_type in {"SEND_STICKER", "CREATE_POLL", "FORWARD_MESSAGE", "CREATE_SCHEDULED_EVENT"}:
+            if config.MUTATING_CHANNEL_IDS and channel_id not in config.MUTATING_CHANNEL_IDS:
+                print(f"🛡️ 拒绝 {action_type}：目标频道 {channel_id} 不在 MUTATING_CHANNEL_IDS。")
+                return f"⚠️ 操作未执行：目标频道不在允许范围内。"
 
         def get_fallback_msg_id(raw_m_id):
             m_id = extract_id(raw_m_id)
@@ -316,6 +323,174 @@ async def execute_action(action_json_str: str, trigger_message: discord.Message)
             msg = await safe_fetch_message(channel_id, msg_id)
             await msg.unpin()
             print(f"✅ 取消置顶")
+
+        elif action_type == "SEND_STICKER" and guild:
+            target = await discord_client.fetch_channel(channel_id)
+            if getattr(getattr(target, "guild", None), "id", None) != guild.id:
+                raise ValueError("贴纸目标频道必须与当前服务器相同")
+            bot_member = guild.get_member(discord_client.user.id)
+            perms = target.permissions_for(bot_member) if bot_member and hasattr(target, "permissions_for") else None
+            can_send = bool(perms and perms.send_messages)
+            if isinstance(target, discord.Thread) and perms:
+                can_send = can_send and getattr(perms, "send_messages_in_threads", True)
+            if perms and not can_send:
+                raise ValueError("Bot 在目标频道缺少 Send Messages 权限")
+            raw_sticker_id = extract_id(data.get("sticker_id"))
+            sticker_name = str(data.get("sticker_name") or "").strip().lower()
+            sticker = None
+            for candidate in guild.stickers:
+                if not getattr(candidate, "available", True):
+                    continue
+                if raw_sticker_id and candidate.id == raw_sticker_id:
+                    sticker = candidate
+                    break
+                if sticker_name and candidate.name.lower() == sticker_name:
+                    sticker = candidate
+                    break
+            if sticker is None:
+                raise ValueError("服务器中没有找到指定贴纸；只能使用当前服务器贴纸")
+            await target.send(stickers=[sticker])
+            print(f"✅ 发送服务器贴纸: {sticker.name} ({sticker.id})")
+
+        elif action_type == "EDIT_OWN_MESSAGE":
+            if response_message is None or response_message.author.id != discord_client.user.id:
+                raise ValueError("只能修改本轮由 Bot 自己刚发出的消息")
+            content = str(data.get("content") or "").strip()
+            if not content or len(content) > 2000:
+                raise ValueError("修改后的消息必须为 1-2000 字")
+            # Even if the model asks often, code enforces a low-frequency refinement.
+            if random.random() > 0.05:
+                print("🪶 本轮措辞修改被低频闸门跳过")
+                return
+            await asyncio.sleep(random.uniform(10, 40))
+            old_content = response_message.content
+            await response_message.edit(content=content)
+            # Keep later conversation context consistent with what Discord now shows.
+            try:
+                from history import get_history, history_key_for
+                hist_key = history_key_for(channel=response_message.channel)
+                async with state.get_bucket_lock(hist_key):
+                    hist = get_history(hist_key)
+                    for entry in reversed(hist):
+                        if entry.get("role") != "assistant" or not isinstance(entry.get("content"), str):
+                            continue
+                        if old_content in entry["content"]:
+                            entry["content"] = entry["content"].replace(old_content, content, 1)
+                            state.mark_history_dirty(hist_key)
+                            break
+            except Exception as history_exc:
+                print(f"⚠️ 自改消息后的历史同步失败: {history_exc}")
+            print(f"✅ 低频修改自己的消息: {response_message.id}")
+
+        elif action_type == "CREATE_POLL" and guild:
+            target = await discord_client.fetch_channel(channel_id)
+            if getattr(getattr(target, "guild", None), "id", None) != guild.id:
+                raise ValueError("投票目标频道必须与当前服务器相同")
+            bot_member = guild.get_member(discord_client.user.id)
+            perms = target.permissions_for(bot_member) if bot_member and hasattr(target, "permissions_for") else None
+            can_send = bool(perms and perms.send_messages)
+            if isinstance(target, discord.Thread) and perms:
+                can_send = can_send and getattr(perms, "send_messages_in_threads", True)
+            if perms and (not can_send or not getattr(perms, "send_polls", True)):
+                raise ValueError("Bot 在目标频道缺少 Send Messages/Send Polls 权限")
+            question = str(data.get("question") or "").strip()[:300]
+            raw_options = data.get("options") or []
+            if not question or not isinstance(raw_options, list) or not 2 <= len(raw_options) <= 10:
+                raise ValueError("投票需要问题和 2-10 个选项")
+            duration_hours = max(1.0, min(float(data.get("duration_hours", 24)), 168.0))
+            poll = discord.Poll(
+                question=question,
+                duration=timedelta(hours=duration_hours),
+                multiple=bool(data.get("multiple", False)),
+            )
+            answer_count = 0
+            for option in raw_options:
+                if isinstance(option, dict):
+                    text = str(option.get("text") or "").strip()[:55]
+                    emoji = option.get("emoji")
+                else:
+                    text, emoji = str(option).strip()[:55], None
+                if text:
+                    poll.add_answer(text=text, emoji=emoji)
+                    answer_count += 1
+            if answer_count < 2:
+                raise ValueError("去除空选项后，投票至少需要 2 个有效选项")
+            sent_poll = await target.send(poll=poll)
+            from polls import record_poll
+            await record_poll(sent_poll, question, datetime.now(timezone.utc) + timedelta(hours=duration_hours))
+            print(f"✅ 创建原生投票: {question}")
+
+        elif action_type == "FORWARD_MESSAGE" and guild:
+            source_channel_id = extract_id(data.get("source_channel_id")) or trigger_message.channel.id
+            message_id = extract_id(data.get("message_id")) or get_fallback_msg_id(None)
+            source = await discord_client.fetch_channel(source_channel_id)
+            target = await discord_client.fetch_channel(channel_id)
+            if any(getattr(getattr(ch, "guild", None), "id", None) != guild.id for ch in (source, target)):
+                raise ValueError("只允许在当前服务器内部转发消息")
+            bot_member = guild.get_member(discord_client.user.id)
+            requester_member = guild.get_member(trigger_message.author.id)
+            if requester_member is None and isinstance(trigger_message.author, discord.Member):
+                requester_member = trigger_message.author
+            if requester_member is None:
+                raise ValueError("无法验证发起者在当前服务器的频道权限")
+            target_perms = target.permissions_for(bot_member) if bot_member and hasattr(target, "permissions_for") else None
+            source_perms = source.permissions_for(bot_member) if bot_member and hasattr(source, "permissions_for") else None
+            requester_target_perms = target.permissions_for(requester_member) if requester_member and hasattr(target, "permissions_for") else None
+            requester_source_perms = source.permissions_for(requester_member) if requester_member and hasattr(source, "permissions_for") else None
+            can_send = bool(target_perms and target_perms.send_messages)
+            if isinstance(target, discord.Thread) and target_perms:
+                can_send = can_send and getattr(target_perms, "send_messages_in_threads", True)
+            if target_perms and not can_send:
+                raise ValueError("Bot 在目标频道缺少 Send Messages 权限")
+            if source_perms and not source_perms.read_message_history:
+                raise ValueError("Bot 在来源频道缺少 Read Message History 权限")
+            if requester_source_perms and not (
+                requester_source_perms.view_channel and requester_source_perms.read_message_history
+            ):
+                raise ValueError("发起者无权读取来源频道")
+            if requester_target_perms and not (
+                requester_target_perms.view_channel and requester_target_perms.send_messages
+            ):
+                raise ValueError("发起者无权在目标频道发言")
+            source_message = await source.fetch_message(message_id)
+            await source_message.forward(target)
+            print(f"✅ 原生转发消息 {message_id} → {channel_id}")
+
+        elif action_type == "CREATE_SCHEDULED_EVENT" and guild:
+            bot_member = guild.get_member(discord_client.user.id)
+            bot_guild_perms = getattr(bot_member, "guild_permissions", None)
+            if bot_guild_perms and not (
+                bot_guild_perms.administrator
+                or bot_guild_perms.manage_events
+                or getattr(bot_guild_perms, "create_events", False)
+            ):
+                raise ValueError("Bot 缺少 Create Events/Manage Events 权限")
+            name = str(data.get("name") or "").strip()[:100]
+            if not name:
+                raise ValueError("活动缺少 name")
+            raw_start = str(data.get("start_time") or "").strip()
+            if raw_start:
+                start = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
+                if start.tzinfo is None:
+                    raise ValueError("start_time 必须包含时区")
+                start = start.astimezone(timezone.utc)
+            else:
+                start = datetime.now(timezone.utc) + timedelta(minutes=max(5, int(data.get("start_in_minutes", 60))))
+            if start < datetime.now(timezone.utc) + timedelta(minutes=5):
+                raise ValueError("活动开始时间必须至少在 5 分钟后")
+            duration_minutes = max(15, min(int(data.get("duration_minutes", 60)), 24 * 60))
+            location = str(data.get("location") or f"Discord #{getattr(trigger_message.channel, 'name', 'text')}").strip()[:100]
+            event = await guild.create_scheduled_event(
+                name=name,
+                description=str(data.get("description") or "").strip()[:1000] or None,
+                start_time=start,
+                end_time=start + timedelta(minutes=duration_minutes),
+                entity_type=discord.EntityType.external,
+                privacy_level=discord.PrivacyLevel.guild_only,
+                location=location,
+                reason=f"Requested by {trigger_message.author} ({trigger_message.author.id})",
+            )
+            print(f"✅ 创建文字/外部服务器活动: {event.name} ({event.id})")
 
         elif action_type in ["KICK", "BAN", "TIMEOUT"] and guild:
             u_id = extract_id(data.get("user_id"))

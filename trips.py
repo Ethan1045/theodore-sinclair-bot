@@ -5,8 +5,8 @@
 无论他在哪里，恋人始终在北京时间，这条不变。
 
 本模块不在顶层 import 任何项目内模块，因此可以被 config、presence、
-tasks_bg、slash_cmds 安全 import；需要落库或刷新状态时用函数内的局部
-import，避免循环依赖。
+life_state、tasks_bg、slash_cmds 安全 import；需要落库或刷新日程时用函数内的
+局部 import，避免循环依赖。
 
 目的地和事由都是 Theodore 这个角色的公共设定（家族办公室、文化基金会、
 旧书与装帧行业、各地的家族分支），不含任何部署者的私人资料；
@@ -250,21 +250,12 @@ async def save_trip_state() -> None:
 
 
 async def _refresh_after_change() -> None:
-    """出发/返程当下就把状态栏顶掉，而不是等下一轮 rotate_presence。"""
+    """出发/返程都会让当天剩下的日程作废，立刻重建并刷新 presence。"""
     try:
-        import discord
-        from client import discord_client
-        from presence import generate_presence, _TYPE_MAP
-        import state
-        text, activity_type, duration_type = await generate_presence()
-        await discord_client.change_presence(
-            status=discord.Status.idle,
-            activity=discord.Activity(type=activity_type, name=text),
-        )
-        kind = next((k for k, v in _TYPE_MAP.items() if v == activity_type), "playing")
-        state.set_current_presence(kind, text, source="trip", duration_type=duration_type)
+        from life_state import refresh_life_state
+        await refresh_life_state(force_presence=True)
     except Exception as e:
-        print(f"⚠️ 出差状态切换后刷新 presence 失败: {e}")
+        print(f"⚠️ 出差状态切换后刷新日程失败: {e}")
 
 
 async def start_trip(destination: dict, days: float | None = None, purpose: str = "") -> dict:

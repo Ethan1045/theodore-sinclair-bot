@@ -22,6 +22,9 @@ from history import (
 from memory import fetch_due_reminders, delete_reminder, get_recall_candidate
 from directives import parse_bot_directives
 from presence import generate_presence, generate_custom_bubble, _TYPE_MAP
+from followups import check_due_followups
+from polls import check_ended_polls
+from life_state import refresh_life_state
 import trips
 
 # ==== 可通过 /post_config 实时修改的参数 ====
@@ -32,6 +35,26 @@ STALE_POST_MAX_REPLIES = 0
 CLEANUP_INTERVAL_HOURS = 12
 CLEANUP_ENABLED = True
 DAILY_CARD_ENABLED = True
+
+# 每日主动话题：在恋人指定的频道池里，每天主动找她聊一两句。
+PROACTIVE_TOPIC_ENABLED = True
+PROACTIVE_TOPIC_CHANNEL_IDS = list(dict.fromkeys(
+    channel_id for channel_id in (config.PARTNER_HOME_CHANNEL_ID, config.PROACTIVE_CHANNEL_ID) if channel_id
+))
+PROACTIVE_TOPIC_MIN_DAILY = 1
+PROACTIVE_TOPIC_MAX_DAILY = 1
+PROACTIVE_TOPIC_START_HOUR = 10
+PROACTIVE_TOPIC_END_HOUR = 23
+PROACTIVE_TOPIC_MIN_GAP_HOURS = 4.0
+PROACTIVE_TOPIC_PREFERENCE = ""
+_proactive_topic_state: dict = {
+    "date": "",
+    "times": [],
+    "sent": 0,
+    "last_sent_at": "",
+    "recent_topics": [],
+    "channel_cursor": 0,
+}
 
 # ==== 每日卡片防重复 ====
 _last_daily_card_date: str = ""
@@ -195,6 +218,13 @@ async def generate_daily_card_data(weather: str | None = None) -> dict | None:
 @tasks.loop(hours=8)
 async def proactive_dm_partner():
     await discord_client.wait_until_ready()
+    # 睡眠时段不主动发私信
+    is_sleeping, sleep_phase = config.is_sleep_time()
+    if state.current_life_slot:
+        is_sleeping = state.current_life_slot.get("availability") == "asleep"
+    if is_sleeping:
+        return
+
     if state.last_partner_activity_at is not None:
         from datetime import timezone
         idle = (datetime.now(timezone.utc) - state.last_partner_activity_at).total_seconds()
@@ -230,7 +260,7 @@ async def proactive_dm_partner():
             prompt_content = (
                 f"（系统提示：{time_ctx} 现在是深夜。你还没睡，想到了恋人，给她发一条私信。"
                 "内容极短，语气比平时更轻，带一点深夜特有的安静感。"
-                f"绝对不要催她睡觉。{FORMAT_REMINDER}）"
+                f"绝对不要催她睡觉。{FORMAT_REMINDER}）{state.life_hint_text()}"
             )
         else:
             recall_note = None
@@ -242,13 +272,13 @@ async def proactive_dm_partner():
                     f"（系统提示：{time_ctx} 你主动给恋人发私信。"
                     f"你想到了她之前提过的一件事：「{recall_note}」。"
                     "请自然地以这件事为由头发一条消息。绝对不要说'我记得你说过'，"
-                    f"直接当共同认知使用。私聊语气，简短。{FORMAT_REMINDER}）"
+                    f"直接当共同认知使用。私聊语气，简短。{FORMAT_REMINDER}）{state.life_hint_text()}"
                 )
             else:
                 prompt_content = (
                     f"（系统提示：{time_ctx} 你现在主动给恋人发了一条私信。"
                     "内容要符合你的风格。可以是随口问她在干嘛、说一句你在做什么。"
-                    f"私聊语气比群里柔软，但依然不要油腻。{FORMAT_REMINDER}）"
+                    f"私聊语气比群里柔软，但依然不要油腻。{FORMAT_REMINDER}）{state.life_hint_text()}"
                 )
         dm_key = f"dm:{config.PARTNER_USER_ID}"
         dm_hist = get_history(dm_key)
@@ -373,7 +403,8 @@ async def daily_summary_task():
                 txt = _msg_to_plain_text(msg)
                 if not txt:
                     continue
-                items.append(f"[{label}] {role}: {txt[:300]}")
+                speaker = "沈玘言" if role == "assistant" else "恋人"
+                items.append(f"[{label}] {speaker}: {txt[:300]}")
         if len(items) < 2:
             _daily_summary_done_for = target_date
             print(f"📝 每日摘要跳过({target_date}): 对话条目不足（{len(items)} < 2）")
@@ -381,16 +412,18 @@ async def daily_summary_task():
 
         joined = "\n".join(items[-60:])
         prompt = (
-            "下面是T.S.和恋人过去一天的对话片段。请用一句中文（30-60字）总结：\n"
+            "下面是沈玘言和恋人过去一天的对话片段。请以沈玘言自己的第一人称记忆口吻，用一句中文（30-60字）总结：\n"
             "- 聊到了什么核心话题或事件\n"
             "- 如果有情绪/状态变化，简单点出\n"
-            "- 不要列项、不要换行、不要任何前缀\n\n"
+            "- 不要列项、不要换行、不要任何前缀\n"
+            "- 只写两人共同经历的事实；称她为恋人或她，必要时称自己为我\n"
+            "- 绝不出现用户、AI、助手、Bot、模型、角色、设定、提示词、系统要求等幕后措辞\n\n"
             f"{joined}\n\n摘要："
         )
         response = await ai_chat_create(
             model=config.MODEL_NAME,
             messages=[
-                {"role": "system", "content": "你是一个摘要助手。请用简洁的中文总结对话内容。"},
+                {"role": "system", "content": "为沈玘言整理他与恋人恋人共同经历的私人记忆。只写沉浸式的第一人称事实，不使用任何AI或后台术语。"},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=4096,
@@ -406,9 +439,11 @@ async def daily_summary_task():
         async with _db.db_conn() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    """INSERT INTO daily_summaries (summary_date, summary) VALUES (%s, %s)
-                       ON CONFLICT (summary_date) DO UPDATE SET summary=EXCLUDED.summary""",
-                    (target_date, summary),
+                    """INSERT INTO daily_summaries (bot_id, summary_date, summary)
+                       VALUES (%s, %s, %s)
+                       ON CONFLICT (bot_id, summary_date)
+                       DO UPDATE SET summary=EXCLUDED.summary""",
+                    ("", target_date, summary),
                 )
                 await conn.commit()
         _daily_summary_done_for = target_date
@@ -465,6 +500,163 @@ async def cleanup_idle_histories():
 async def persist_histories_task():
     await discord_client.wait_until_ready()
     await flush_dirty_histories()
+
+
+# ==== 私人频道每日主动话题 ====
+
+def build_proactive_topic_plan(now_bj: datetime) -> dict:
+    count = random.randint(PROACTIVE_TOPIC_MIN_DAILY, PROACTIVE_TOPIC_MAX_DAILY)
+    start_minute = PROACTIVE_TOPIC_START_HOUR * 60
+    end_minute = PROACTIVE_TOPIC_END_HOUR * 60
+    if count <= 0:
+        times: list[str] = []
+    elif count == 1:
+        minute = random.randrange(start_minute, end_minute)
+        times = [f"{minute // 60:02d}:{minute % 60:02d}"]
+    else:
+        minimum_gap = int(PROACTIVE_TOPIC_MIN_GAP_HOURS * 60)
+        slack = max(0, (end_minute - start_minute - 1) - minimum_gap * (count - 1))
+        offsets = sorted(random.uniform(0, slack) for _ in range(count))
+        minutes = [start_minute + i * minimum_gap + int(offsets[i]) for i in range(count)]
+        times = [f"{minute // 60:02d}:{minute % 60:02d}" for minute in minutes]
+    previous = _proactive_topic_state or {}
+    return {
+        "date": now_bj.date().isoformat(),
+        "times": times,
+        "sent": 0,
+        "last_sent_at": "",
+        "recent_topics": list(previous.get("recent_topics") or [])[-5:],
+        "channel_cursor": int(previous.get("channel_cursor", 0)),
+    }
+
+
+async def ensure_proactive_topic_plan(now_bj: datetime) -> None:
+    global _proactive_topic_state
+    if (
+        _proactive_topic_state.get("date") == now_bj.date().isoformat()
+        and isinstance(_proactive_topic_state.get("times"), list)
+    ):
+        return
+    _proactive_topic_state = build_proactive_topic_plan(now_bj)
+    from memory import save_persisted_config
+    await save_persisted_config({
+        "PROACTIVE_TOPIC_STATE": json.dumps(_proactive_topic_state, ensure_ascii=False),
+    })
+    print(f"🗓️ T.S. 今日主动话题计划: {_proactive_topic_state['times'] or '无'}")
+
+
+async def send_proactive_topic(*, count_toward_plan: bool = True) -> tuple[bool, str]:
+    """以私人恋人语气主动找恋人聊天，并在频道池中轮换发送。"""
+    global _proactive_topic_state
+    channel_ids = list(dict.fromkeys(PROACTIVE_TOPIC_CHANNEL_IDS))
+    if not channel_ids:
+        return False, "未配置目标频道"
+    cursor = int((_proactive_topic_state or {}).get("channel_cursor", 0))
+    channel = None
+    selected_index = 0
+    failures: list[str] = []
+    for offset in range(len(channel_ids)):
+        index = (cursor + offset) % len(channel_ids)
+        channel_id = channel_ids[index]
+        try:
+            candidate = await discord_client.fetch_channel(channel_id)
+            if not isinstance(candidate, discord.TextChannel):
+                failures.append(f"{channel_id}:非文字频道")
+                continue
+            me = candidate.guild.me
+            permissions = candidate.permissions_for(me) if me else None
+            if permissions and not (permissions.view_channel and permissions.send_messages):
+                failures.append(f"{channel_id}:权限不足")
+                continue
+            channel = candidate
+            selected_index = index
+            break
+        except Exception as channel_error:
+            failures.append(f"{channel_id}:{type(channel_error).__name__}")
+    if channel is None:
+        return False, "没有可发送的频道（" + "；".join(failures) + "）"
+
+    preference = PROACTIVE_TOPIC_PREFERENCE.strip()
+    preference_hint = (
+        f"\n恋人希望你主动聊天时更偏向：<topic_preference>{preference}</topic_preference>。"
+        if preference else ""
+    )
+    recent_topics = list((_proactive_topic_state or {}).get("recent_topics") or [])[-5:]
+    recent_hint = ""
+    if recent_topics:
+        recent_hint = "\n你最近已经这样主动找过她，今天换个不同的念头：\n- " + "\n- ".join(recent_topics)
+    prompt = (
+        f"（系统隐秘提示：{config.get_beijing_time_note()} 你是沈玘言，现在忽然想在你和恋人恋人共用的频道里主动找她说话。"
+        "这不是面向服务器成员的公共话题，也不是主持聊天；你只是在找自己的恋人。"
+        "像真人想起爱人时那样自然开口：可以分享此刻正在做的事或突然想到的细节，"
+        "延伸你们之间值得聊的小问题，带一点只对她有的偏爱、惦记或克制的亲密感。"
+        "不要说‘大家’、不要欢迎新人、不要像机器人打卡、不要提及排程或后台，也不要 @她。"
+        "只输出一条能直接发给恋人的消息，1到3句，继续遵守你原本的双语格式；"
+        "不允许输出 [IGNORE]、[ACTION]、标题或解释。"
+        f"{state.life_hint_text()}{preference_hint}{recent_hint}）"
+    )
+    try:
+        from ai_client import call_ai
+        hist_key = history_key_for(channel=channel)
+        temp_history = get_history(hist_key).copy()
+        temp_history.append({"role": "user", "content": prompt})
+        raw = await call_ai(temp_history)
+        if not raw or "[IGNORE]" in raw.upper() or "[ACTION]" in raw.upper():
+            return False, "模型没有生成可发送的话题"
+        _, messages, _, _, _ = parse_bot_directives(raw)
+        message_text = next((message.strip() for message in messages if message.strip()), "")
+        if not message_text:
+            return False, "模型返回了空内容"
+        message_text = message_text[:1900]
+        await channel.send(message_text)
+
+        async with state.get_bucket_lock(hist_key):
+            get_history(hist_key).append({"role": "assistant", "content": message_text})
+            state.mark_history_dirty(hist_key)
+        await trim_history(hist_key)
+
+        recent_topics.append(message_text[:300])
+        _proactive_topic_state["recent_topics"] = recent_topics[-5:]
+        _proactive_topic_state["last_sent_at"] = datetime.now(timezone.utc).isoformat()
+        _proactive_topic_state["channel_cursor"] = (selected_index + 1) % len(channel_ids)
+        if count_toward_plan:
+            _proactive_topic_state["sent"] = int(_proactive_topic_state.get("sent", 0)) + 1
+        from memory import save_persisted_config
+        await save_persisted_config({
+            "PROACTIVE_TOPIC_STATE": json.dumps(_proactive_topic_state, ensure_ascii=False),
+        })
+        print(f"✅ T.S. 主动话题已发送到 #{channel.name}: {message_text[:100]}")
+        return True, f"已发送到 {channel.mention}"
+    except Exception as e:
+        print(f"⚠️ T.S. 主动话题发送失败: {type(e).__name__}: {e}")
+        return False, f"{type(e).__name__}: {e}"
+
+
+@tasks.loop(minutes=15)
+async def proactive_topic_check():
+    await discord_client.wait_until_ready()
+    if not PROACTIVE_TOPIC_ENABLED or not PROACTIVE_TOPIC_CHANNEL_IDS:
+        return
+    now_bj = datetime.now(ZoneInfo("Asia/Shanghai"))
+    await ensure_proactive_topic_plan(now_bj)
+    if not (PROACTIVE_TOPIC_START_HOUR <= now_bj.hour < PROACTIVE_TOPIC_END_HOUR):
+        return
+    if (state.current_life_slot or {}).get("availability") == "asleep":
+        return
+    planned = list(_proactive_topic_state.get("times") or [])
+    sent = int(_proactive_topic_state.get("sent", 0))
+    due_count = sum(1 for planned_time in planned if planned_time <= now_bj.strftime("%H:%M"))
+    if sent >= due_count or sent >= len(planned):
+        return
+    last_raw = str(_proactive_topic_state.get("last_sent_at") or "")
+    if last_raw:
+        try:
+            last_sent = datetime.fromisoformat(last_raw)
+            if datetime.now(timezone.utc) - last_sent < timedelta(hours=PROACTIVE_TOPIC_MIN_GAP_HOURS):
+                return
+        except ValueError:
+            pass
+    await send_proactive_topic(count_toward_plan=True)
 
 
 @tasks.loop(hours=1)
@@ -737,22 +929,112 @@ async def trip_scheduler_check():
     await trips.scheduler_tick()
 
 
+async def _wakeup_catchup():
+    """睡醒后补回复：把睡眠期间收到的消息打包，按频道分组，逐个补回复。"""
+    pending = list(state.sleep_pending_messages)
+    state.sleep_pending_messages.clear()
+    if not pending:
+        return
+
+    await asyncio.sleep(random.uniform(60, 180))
+
+    from ai_client import call_ai
+    from reply import send_ai_reply
+
+    by_channel: dict[int, list[dict]] = {}
+    for entry in pending:
+        by_channel.setdefault(entry["channel_id"], []).append(entry)
+
+    for ch_id, entries in by_channel.items():
+        try:
+            channel = await discord_client.fetch_channel(ch_id)
+
+            lines = []
+            for e in entries:
+                status = "你迷迷糊糊回了一句" if e["drowsy"] else "你只挂了个睡觉表情"
+                lines.append(f"- {e['display_name']} 说：「{e['text']}」（{status}）")
+            summary = "\n".join(lines)
+
+            last_entry = entries[-1]
+            last_message = None
+            try:
+                last_message = await channel.fetch_message(last_entry["message_id"])
+            except Exception:
+                pass
+
+            # 出差时把位置一并交代清楚，免得他人在东京却说「伦敦今天下雨」。
+            time_ctx = config.get_beijing_time_note() + trips.trip_hint_text()
+            FORMAT_REMINDER = (
+                "【⚠️格式硬约束（不允许妥协）】"
+                "1) 每一条消息严格两行：第一行英文，第二行中文翻译用括号括起来。"
+                "2) 多条消息之间必须用大写 [SPLIT] 单独占一行隔开。"
+                "3) 整段输出里不允许出现 [REACTION:...]。"
+            )
+            prompt = (
+                f"（系统提示：{time_ctx} 你刚睡醒，拿起手机看到睡着的时候收到了这些消息：\n"
+                f"{summary}\n\n"
+                "你现在要像真人睡醒看手机一样，回去补回复这些消息。"
+                "语气自然，像是刚醒来翻手机然后逐条回——可以带一点刚睡醒的慵懒感，但已经清醒了。"
+                "如果之前迷迷糊糊回过，可以补充、纠正、或接着之前的话继续。"
+                "如果只是挂了表情没回，现在要正式回复内容。"
+                f"分多段用 [SPLIT] 隔开。{FORMAT_REMINDER}）"
+            )
+
+            if last_entry["is_dm"]:
+                hist_key = f"dm:{last_entry['user_id']}"
+            else:
+                hist_key = history_key_for(channel=channel)
+
+            hist = get_history(hist_key)
+            temp_history = hist.copy()
+            temp_history.append({"role": "user", "content": prompt})
+
+            raw_reply = await call_ai(temp_history)
+            if "[IGNORE]" in raw_reply.upper():
+                continue
+
+            if last_message:
+                await send_ai_reply(raw_reply, last_message, channel)
+            else:
+                _, msgs, _, _, _ = parse_bot_directives(raw_reply)
+                for msg_text in msgs:
+                    await channel.send(msg_text)
+                    await asyncio.sleep(1.5)
+
+            print(f"✅ 睡醒补回复: 频道 {ch_id}，{len(entries)} 条待处理")
+        except Exception as e:
+            print(f"⚠️ 睡醒补回复失败 (频道 {ch_id}): {e}")
+
+
 @tasks.loop(minutes=2)
 async def rotate_presence():
     await discord_client.wait_until_ready()
-    if not _should_rotate_presence():
-        return
-    if random.random() < 0.25:
-        bubble_text = await generate_custom_bubble()
-        activity = discord.CustomActivity(name=bubble_text)
-        await discord_client.change_presence(status=discord.Status.idle, activity=activity)
-        state.set_current_presence("custom", bubble_text, source="rotate-bubble", duration_type="sustained")
-    else:
-        text, activity_type, duration_type = await generate_presence()
-        activity = discord.Activity(type=activity_type, name=text)
-        await discord_client.change_presence(status=discord.Status.idle, activity=activity)
-        kind = next((k for k, v in _TYPE_MAP.items() if v == activity_type), "playing")
-        state.set_current_presence(kind, text, source="rotate", duration_type=duration_type)
+    previous = state.current_life_slot or {}
+    previous_availability = previous.get("availability")
+    slot, changed = await refresh_life_state()
+
+    if previous_availability == "busy" and slot.get("availability") != "busy":
+        state.work_busy_until = None
+        state.work_busy_activity = ""
+    elif slot.get("availability") != "busy":
+        state.work_busy_until = None
+        state.work_busy_activity = ""
+
+    if previous_availability == "asleep" and slot.get("availability") != "asleep":
+        if state.sleep_pending_messages:
+            state.spawn_bg(_wakeup_catchup(), name="wakeup_catchup")
+
+
+@tasks.loop(minutes=30)
+async def commitment_followup_check():
+    await discord_client.wait_until_ready()
+    await check_due_followups()
+
+
+@tasks.loop(minutes=5)
+async def poll_followup_check():
+    await discord_client.wait_until_ready()
+    await check_ended_polls()
 
 
 # ==== 随机论坛发帖 ====
@@ -790,6 +1072,7 @@ async def random_forum_post():
         time_ctx = config.get_beijing_time_note() + trips.trip_hint_text()
         prompt = (
             f"（系统提示：{time_ctx} 你现在打开了自己的论坛频道，想随手发一个帖子。\n"
+            f"{state.life_hint_text()}\n"
             "帖子主题可以是你最近在思考的事、看到的东西、读的书、听的音乐、"
             "某个回忆、一段观察、一个无聊的想法，或者任何你觉得值得写两句的东西。\n"
             "风格保持克制、真实，不要鸡汤，不要太长。双语格式。\n"

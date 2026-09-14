@@ -1,5 +1,6 @@
 """所有 Discord slash 命令（/partner, /ts, /remind, /what_doing 等）。"""
 import asyncio
+import json
 import random
 import re
 from datetime import datetime, timezone
@@ -334,14 +335,29 @@ async def slash_memory_list(interaction: discord.Interaction):
         if not rows:
             await interaction.followup.send("还没有存下任何记忆。", ephemeral=True)
             return
-        lines = ["**T.S. 记住的事**（最近30条）\n"]
+        lines = ["**承诺账本**（共 {count} 条）\n".format(count=len(rows))]
         for idx, (note, created_at, recall_count) in enumerate(rows, start=1):
             delta = datetime.now(timezone.utc) - created_at.replace(tzinfo=timezone.utc)
             days = delta.days
             label = "今天" if days == 0 else ("昨天" if days == 1 else f"{days}天前")
-            recalled = f" · 已提起{recall_count}次" if recall_count > 0 else ""
-            lines.append(f"`序号 {idx}` {label}{recalled}　{note}")
-        await interaction.followup.send("\n".join(lines), ephemeral=True)
+            recalled = f" · 提起过{recall_count}次" if recall_count > 0 else ""
+            lines.append(f"`{idx}.` {label}{recalled}　{note}")
+        # Discord 单条消息上限 2000 字符，分页发送
+        pages: list[str] = []
+        current_page: list[str] = []
+        current_len = 0
+        for line in lines:
+            line_len = len(line) + 1  # +1 for newline
+            if current_len + line_len > 1900 and current_page:
+                pages.append("\n".join(current_page))
+                current_page = []
+                current_len = 0
+            current_page.append(line)
+            current_len += line_len
+        if current_page:
+            pages.append("\n".join(current_page))
+        for page in pages:
+            await interaction.followup.send(page, ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ 读取失败：{e}", ephemeral=True)
     finally:
@@ -484,7 +500,7 @@ async def slash_memory_delete(interaction: discord.Interaction):
 
 
 @memory_group.command(name="添加", description="手动让T.S.记住一件事")
-@app_commands.describe(内容="想让他记住的内容（不超过50字）")
+@app_commands.describe(内容="想让他记住的完整内容（最多500字，不会静默截断）")
 async def slash_memory_add(interaction: discord.Interaction, 内容: str):
     if interaction.user.id != config.PARTNER_USER_ID:
         await interaction.response.send_message("这个指令只有恋人能用。", ephemeral=True)
@@ -493,9 +509,12 @@ async def slash_memory_add(interaction: discord.Interaction, 内容: str):
     if not config.DATABASE_URL:
         await interaction.followup.send("❌ 数据库未配置。", ephemeral=True)
         return
-    note_text = 内容.strip()[:50]
+    note_text = 内容.strip()
     if not note_text:
         await interaction.followup.send("❌ 内容不能为空。", ephemeral=True)
+        return
+    if len(note_text) > 500:
+        await interaction.followup.send(f"❌ 内容共 {len(note_text)} 字，超过500字上限；请精简后重试。", ephemeral=True)
         return
     try:
         async with db_conn() as conn:
@@ -513,10 +532,10 @@ async def slash_memory_add(interaction: discord.Interaction, 内容: str):
 
 @memory_group.command(name="编辑", description="编辑T.S.的一条记忆")
 @app_commands.describe(
-    序号="要编辑的记忆序号（/memory_list 里显示的序号）",
-    新内容="修改后的内容（不超过50字）"
+    记忆="直接搜索并选择要编辑的记忆",
+    新内容="修改后的完整内容（最多500字，不会静默截断）"
 )
-async def slash_memory_edit(interaction: discord.Interaction, 序号: int, 新内容: str):
+async def slash_memory_edit(interaction: discord.Interaction, 记忆: str, 新内容: str):
     if interaction.user.id != config.PARTNER_USER_ID:
         await interaction.response.send_message("这个指令只有恋人能用。", ephemeral=True)
         return
@@ -524,25 +543,30 @@ async def slash_memory_edit(interaction: discord.Interaction, 序号: int, 新�
     if not config.DATABASE_URL:
         await interaction.followup.send("❌ 数据库未配置。", ephemeral=True)
         return
-    new_text = 新内容.strip()[:50]
+    new_text = 新内容.strip()
     if not new_text:
         await interaction.followup.send("❌ 新内容不能为空。", ephemeral=True)
         return
-    if 序号 < 1:
-        await interaction.followup.send("❌ 序号必须是正整数。", ephemeral=True)
+    if len(new_text) > 500:
+        await interaction.followup.send(f"❌ 新内容共 {len(new_text)} 字，超过500字上限；请精简后重试。", ephemeral=True)
         return
     try:
-        rows = await _fetch_memory_rows()
-    except Exception as e:
-        await interaction.followup.send(f"❌ 读取记忆失败：{e}", ephemeral=True)
+        target_id = int(记忆)
+    except (TypeError, ValueError):
+        await interaction.followup.send("❌ 请从候选列表中选择一条记忆。", ephemeral=True)
         return
-    if 序号 > len(rows):
-        await interaction.followup.send(f"❌ 序号超出范围，当前共 {len(rows)} 条记忆。", ephemeral=True)
-        return
-    target_id, old_note, *_ = rows[序号 - 1]
     try:
         async with db_conn() as conn:
             async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT note FROM user_notes WHERE id = %s AND user_id = %s",
+                    (target_id, str(config.PARTNER_USER_ID)),
+                )
+                row = await cur.fetchone()
+                if not row:
+                    await interaction.followup.send("❌ 该记忆已不存在，请重新选择。", ephemeral=True)
+                    return
+                old_note = row[0]
                 await cur.execute(
                     "UPDATE user_notes SET note = %s WHERE id = %s AND user_id = %s RETURNING id",
                     (new_text, target_id, str(config.PARTNER_USER_ID))
@@ -553,7 +577,7 @@ async def slash_memory_edit(interaction: discord.Interaction, 序号: int, 新�
             await interaction.followup.send("❌ 该记忆已不存在。", ephemeral=True)
             return
         await interaction.followup.send(
-            f"✅ 记忆 `序号 {序号}` 已更新\n"
+            "✅ 记忆已更新\n"
             f"　旧：{old_note}\n　新：{new_text}"
         )
         prompt = (
@@ -570,6 +594,29 @@ async def slash_memory_edit(interaction: discord.Interaction, 序号: int, 新�
             await interaction.followup.send(msg_text)
     except Exception as e:
         await interaction.followup.send(f"❌ 编辑失败：{e}", ephemeral=True)
+
+
+@slash_memory_edit.autocomplete("记忆")
+async def _memory_edit_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    if interaction.user.id != config.PARTNER_USER_ID or not config.DATABASE_URL:
+        return []
+    try:
+        rows = await _fetch_memory_rows()
+    except Exception:
+        return []
+    needle = (current or "").strip().lower()
+    matches = []
+    for mid, note, _created, _rc, cat in reversed(rows):
+        display = f"[{cat}] {note}" if cat else str(note)
+        if needle and needle not in display.lower():
+            continue
+        matches.append(app_commands.Choice(name=display[:100], value=str(mid)))
+        if len(matches) >= 25:
+            break
+    return matches
 
 
 @memory_group.command(name="清空", description="一键清空T.S.的所有记忆")
@@ -721,6 +768,166 @@ async def slash_card_now(interaction: discord.Interaction):
         print(f"✅ /card_now 手动触发卡片: {now_local.strftime('%Y-%m-%d %H:%M')}")
     except Exception as e:
         await interaction.followup.send(f"❌ 生成失败：{e}", ephemeral=True)
+
+
+@slash_tree.command(name="主动话题设置", description="恋人专属：配置沈玘言每天主动找你聊天的频道与方式")
+@app_commands.describe(
+    启用="是否开启每日主动聊天",
+    添加频道="把一个普通文字频道加入私人主动聊天池",
+    移除频道="从私人主动聊天池移除一个频道",
+    清空频道="清空整个主动聊天频道池",
+    每日最少="每天至少主动几次（0~5）",
+    每日最多="每天最多主动几次（0~5）",
+    开始小时="允许发送的北京时间起点（0~23）",
+    结束小时="允许发送的北京时间终点（1~24，不包含该小时）",
+    最短间隔小时="两次主动聊天至少间隔多少小时（0.5~24）",
+    话题偏好="告诉他更想聊什么；填“清空”恢复自由发挥",
+    立即发送="保存后立即让他找你说一句（不占今日次数）",
+)
+async def slash_proactive_topic_config(
+    interaction: discord.Interaction,
+    启用: bool | None = None,
+    添加频道: discord.TextChannel | None = None,
+    移除频道: discord.TextChannel | None = None,
+    清空频道: bool = False,
+    每日最少: int | None = None,
+    每日最多: int | None = None,
+    开始小时: int | None = None,
+    结束小时: int | None = None,
+    最短间隔小时: float | None = None,
+    话题偏好: str | None = None,
+    立即发送: bool = False,
+):
+    if interaction.user.id != config.PARTNER_USER_ID:
+        await interaction.response.send_message("这个指令只有恋人能用。", ephemeral=True)
+        return
+
+    new_min = tasks_bg.PROACTIVE_TOPIC_MIN_DAILY if 每日最少 is None else 每日最少
+    new_max = tasks_bg.PROACTIVE_TOPIC_MAX_DAILY if 每日最多 is None else 每日最多
+    new_start = tasks_bg.PROACTIVE_TOPIC_START_HOUR if 开始小时 is None else 开始小时
+    new_end = tasks_bg.PROACTIVE_TOPIC_END_HOUR if 结束小时 is None else 结束小时
+    new_gap = tasks_bg.PROACTIVE_TOPIC_MIN_GAP_HOURS if 最短间隔小时 is None else 最短间隔小时
+
+    if not (0 <= new_min <= new_max <= 5):
+        await interaction.response.send_message("每日次数必须满足 `0 ≤ 最少 ≤ 最多 ≤ 5`。", ephemeral=True)
+        return
+    if not (0 <= new_start < new_end <= 24):
+        await interaction.response.send_message("时间段必须满足 `0 ≤ 开始小时 < 结束小时 ≤ 24`。", ephemeral=True)
+        return
+    if not (0.5 <= new_gap <= 24):
+        await interaction.response.send_message("最短间隔必须在 0.5~24 小时之间。", ephemeral=True)
+        return
+    if new_max > 1 and (new_max - 1) * new_gap >= new_end - new_start:
+        await interaction.response.send_message(
+            "这个时间段放不下设定的最多次数和最短间隔；请扩大时间段、减少次数或缩短间隔。",
+            ephemeral=True,
+        )
+        return
+    if 添加频道 is not None:
+        if 添加频道.id in config.SILENT_CHANNEL_IDS:
+            await interaction.response.send_message("这个频道在静默列表中；请先移出静默列表或选择别的频道。", ephemeral=True)
+            return
+        me = 添加频道.guild.me
+        permissions = 添加频道.permissions_for(me) if me else None
+        if permissions and not (permissions.view_channel and permissions.send_messages):
+            await interaction.response.send_message("T.S. 在添加的频道缺少“查看频道”或“发送消息”权限。", ephemeral=True)
+            return
+    if 话题偏好 is not None and len(话题偏好.strip()) > 500:
+        await interaction.response.send_message("话题偏好最多 500 字。", ephemeral=True)
+        return
+
+    updates: dict[str, object] = {}
+    changes: list[str] = []
+    schedule_changed = False
+    channels_changed = False
+    if 启用 is not None:
+        tasks_bg.PROACTIVE_TOPIC_ENABLED = 启用
+        updates["PROACTIVE_TOPIC_ENABLED"] = 启用
+        changes.append(f"开关 → {'开' if 启用 else '关'}")
+    if 清空频道:
+        tasks_bg.PROACTIVE_TOPIC_CHANNEL_IDS = []
+        changes.append("频道池 → 已清空")
+        channels_changed = True
+    if 移除频道 is not None and 移除频道.id in tasks_bg.PROACTIVE_TOPIC_CHANNEL_IDS:
+        tasks_bg.PROACTIVE_TOPIC_CHANNEL_IDS = [
+            channel_id for channel_id in tasks_bg.PROACTIVE_TOPIC_CHANNEL_IDS
+            if channel_id != 移除频道.id
+        ]
+        changes.append(f"移除频道 → {移除频道.mention}")
+        channels_changed = True
+    if 添加频道 is not None and 添加频道.id not in tasks_bg.PROACTIVE_TOPIC_CHANNEL_IDS:
+        tasks_bg.PROACTIVE_TOPIC_CHANNEL_IDS.append(添加频道.id)
+        changes.append(f"添加频道 → {添加频道.mention}")
+        channels_changed = True
+    if channels_changed:
+        updates["PROACTIVE_TOPIC_CHANNEL_IDS"] = json.dumps(tasks_bg.PROACTIVE_TOPIC_CHANNEL_IDS)
+    if 每日最少 is not None:
+        tasks_bg.PROACTIVE_TOPIC_MIN_DAILY = new_min
+        updates["PROACTIVE_TOPIC_MIN_DAILY"] = new_min
+        changes.append(f"每日最少 → {new_min}")
+        schedule_changed = True
+    if 每日最多 is not None:
+        tasks_bg.PROACTIVE_TOPIC_MAX_DAILY = new_max
+        updates["PROACTIVE_TOPIC_MAX_DAILY"] = new_max
+        changes.append(f"每日最多 → {new_max}")
+        schedule_changed = True
+    if 开始小时 is not None:
+        tasks_bg.PROACTIVE_TOPIC_START_HOUR = new_start
+        updates["PROACTIVE_TOPIC_START_HOUR"] = new_start
+        changes.append(f"开始 → {new_start}:00")
+        schedule_changed = True
+    if 结束小时 is not None:
+        tasks_bg.PROACTIVE_TOPIC_END_HOUR = new_end
+        updates["PROACTIVE_TOPIC_END_HOUR"] = new_end
+        changes.append(f"结束 → {new_end}:00")
+        schedule_changed = True
+    if 最短间隔小时 is not None:
+        tasks_bg.PROACTIVE_TOPIC_MIN_GAP_HOURS = float(new_gap)
+        updates["PROACTIVE_TOPIC_MIN_GAP_HOURS"] = tasks_bg.PROACTIVE_TOPIC_MIN_GAP_HOURS
+        changes.append(f"最短间隔 → {tasks_bg.PROACTIVE_TOPIC_MIN_GAP_HOURS:g}h")
+        schedule_changed = True
+    if 话题偏好 is not None:
+        normalized = 话题偏好.strip()
+        tasks_bg.PROACTIVE_TOPIC_PREFERENCE = "" if normalized.lower() in {"清空", "clear", "reset", "-"} else normalized
+        updates["PROACTIVE_TOPIC_PREFERENCE"] = tasks_bg.PROACTIVE_TOPIC_PREFERENCE
+        changes.append("话题偏好 → " + (tasks_bg.PROACTIVE_TOPIC_PREFERENCE or "自由发挥"))
+
+    if schedule_changed:
+        tasks_bg._proactive_topic_state = tasks_bg.build_proactive_topic_plan(
+            datetime.now(ZoneInfo("Asia/Shanghai"))
+        )
+        updates["PROACTIVE_TOPIC_STATE"] = json.dumps(
+            tasks_bg._proactive_topic_state, ensure_ascii=False
+        )
+
+    await interaction.response.defer(ephemeral=True)
+    if updates:
+        await save_persisted_config(updates)
+
+    test_result = ""
+    if 立即发送:
+        ok, detail = await tasks_bg.send_proactive_topic(count_toward_plan=False)
+        test_result = f"\n- 立即测试：{'✅' if ok else '❌'} {detail}"
+
+    channel_display = "、".join(
+        f"<#{channel_id}>" for channel_id in tasks_bg.PROACTIVE_TOPIC_CHANNEL_IDS
+    ) or "未配置"
+    planned_times = "、".join(tasks_bg._proactive_topic_state.get("times") or []) or "无"
+    lines = [
+        "**💬 当前私人主动聊天配置**",
+        f"- 状态：{'✅开启' if tasks_bg.PROACTIVE_TOPIC_ENABLED else '❌关闭'}",
+        f"- 频道：{channel_display}",
+        f"- 每日次数：{tasks_bg.PROACTIVE_TOPIC_MIN_DAILY}~{tasks_bg.PROACTIVE_TOPIC_MAX_DAILY}",
+        f"- 活跃时段：北京时间 {tasks_bg.PROACTIVE_TOPIC_START_HOUR:02d}:00–{tasks_bg.PROACTIVE_TOPIC_END_HOUR:02d}:00",
+        f"- 最短间隔：{tasks_bg.PROACTIVE_TOPIC_MIN_GAP_HOURS:g} 小时",
+        f"- 话题偏好：{tasks_bg.PROACTIVE_TOPIC_PREFERENCE or '自由发挥'}",
+        f"- 今日计划：{planned_times}",
+    ]
+    if changes:
+        lines.insert(0, "✅ 已更新：" + "；".join(changes) + "\n")
+    if test_result:
+        lines.append(test_result)
+    await interaction.followup.send("\n".join(lines)[:2000], ephemeral=True)
 
 
 @slash_tree.command(name="post_config", description="恋人专属：查看/修改发帖与旧帖清理参数（所有参数都可选）")
