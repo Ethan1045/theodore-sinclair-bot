@@ -2,6 +2,7 @@
 import asyncio
 import random
 import re
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -106,15 +107,30 @@ async def try_keyword_presence_update(text: str) -> None:
             return
 
 
+def _where_is_he() -> tuple[str, str]:
+    """(城市英文名, 给提示词用的一句位置说明)。出差时状态栏也要跟着那座城市走。"""
+    import trips
+    location = trips.current_location()
+    if not location["is_trip"]:
+        return location["city_en"], "He is at home in London."
+    return location["city_en"], (
+        f"He is NOT in London right now — he is on a business trip in {location['city_en']}. "
+        f"Base the status on {location['city_en']} local time and surroundings (hotel, meetings, jet lag), "
+        "without turning it into travel bragging."
+    )
+
+
 async def generate_presence() -> tuple[str, discord.ActivityType, str]:
     from config import get_presence_time_context
     time_ctx = get_presence_time_context()
+    city_en, where_hint = _where_is_he()
     prompt = (
         f"{time_ctx}\n"
-        "Generate a Discord status for T.S. (Theodore Sinclair / 沈玘言), a 32-year-old Anglo-Chinese man living in London.\n"
+        "Generate a Discord status for T.S. (Theodore Sinclair / 沈玘言), a 32-year-old Anglo-Chinese man based in London.\n"
+        f"{where_hint}\n"
         "The status appears next to his avatar as 'Listening to xxx' / 'Playing xxx' / 'Watching xxx'.\n\n"
         "【Rules】\n"
-        "1. Base the activity on HIS London local time — what would he plausibly be doing right now?\n"
+        f"1. Base the activity on HIS local time in {city_en} — what would he plausibly be doing right now?\n"
         "1a. His temperament is consistently gentle, composed, restrained, highly capable and well-mannered. The status must fit his established life: family-office work, foundation governance, archival/book conservation, serious reading, fencing, swimming, riding, tea, restrained music listening or quiet travel.\n"
         "1b. Do not invent quirky habits, comic incompetence, flippant thoughts, internet slang, attention-seeking moods, melodrama or random contrast for 'human realism'. Never make him look unserious or out of character.\n"
         "2. listening → a real song / album / artist\n"
@@ -199,12 +215,14 @@ async def generate_presence() -> tuple[str, discord.ActivityType, str]:
 async def generate_custom_bubble() -> str:
     from config import get_presence_time_context
     time_ctx = get_presence_time_context()
+    city_en, where_hint = _where_is_he()
     recent_str = ", ".join(state._recent_presences[-5:]) if state._recent_presences else "none"
 
     prompt = (
         f"{time_ctx}\n"
         "Generate a Discord custom status bubble for T.S. (Theodore Sinclair / 沈玘言), "
-        "a 32-year-old Anglo-Chinese man living in London.\n"
+        "a 32-year-old Anglo-Chinese man based in London.\n"
+        f"{where_hint}\n"
         "This text appears in a bubble next to his avatar, like a real person's casual status update.\n\n"
         "【Direction (pick one randomly)】\n"
         "- A random thought in his head (very short, like talking to himself)\n"
@@ -212,7 +230,7 @@ async def generate_custom_bubble() -> str:
         "- A small thing he's doing right now\n"
         "- A cryptic one-liner that fits his vibe\n\n"
         "【Language】Mostly English (70-80%), occasionally Chinese or mixed. He's half-British half-Chinese.\n"
-        "【Time】Base it on his London local time, not Beijing time.\n"
+        f"【Time】Base it on his local time in {city_en}, not Beijing time.\n"
         "【Forbidden】Motivational quotes, saccharine tone, marketing-speak\n"
         "- Don't repeat recent statuses: " + recent_str + "\n\n"
         "【Format】Max 40 characters, shorter is better, output exactly one line.\n\n"
@@ -258,9 +276,13 @@ async def generate_custom_bubble() -> str:
         return text
 
 
-async def get_london_weather() -> str | None:
+async def get_city_weather(city_en: str = "London") -> str | None:
+    """查某座城市的实时天气。出差时传目的地，在家时就是伦敦。"""
+    city = (city_en or "London").strip() or "London"
+    query = urllib.parse.quote(city.replace(" ", "+"), safe="+")
+
     def _fetch():
-        url = "https://wttr.in/London?format=%C+%t&lang=en"
+        url = f"https://wttr.in/{query}?format=%C+%t&lang=en"
         req = urllib.request.Request(url, headers={"User-Agent": "curl/7.0"})
         with urllib.request.urlopen(req, timeout=5) as r:
             return r.read().decode().strip()
@@ -268,6 +290,12 @@ async def get_london_weather() -> str | None:
         return await asyncio.to_thread(_fetch)
     except Exception:
         return None
+
+
+async def get_london_weather() -> str | None:
+    """兼容旧调用：他此刻所在地的天气（在家就是伦敦）。"""
+    import trips
+    return await get_city_weather(trips.current_location()["city_en"])
 
 
 def get_guild_emoji_hint(guild: "discord.Guild | None") -> str:

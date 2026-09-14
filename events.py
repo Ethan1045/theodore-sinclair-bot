@@ -35,6 +35,7 @@ from directives import parse_bot_directives
 from reply import send_ai_reply, _keep_typing
 from db import db_conn, init_db_pool
 import tasks_bg
+import trips
 from followups import ensure_followup_table, capture_partner_message
 from life_state import ensure_life_schedule_table, refresh_life_state
 from polls import ensure_poll_followup_table
@@ -100,6 +101,7 @@ async def on_ready():
         (tasks_bg.forum_interaction,        "forum_interaction"),
         (tasks_bg.commitment_followup_check, "commitment_followup_check"),
         (tasks_bg.poll_followup_check,      "poll_followup_check"),
+        (tasks_bg.trip_scheduler_check,     "trip_scheduler_check"),
     ):
         try:
             tasks_bg._attach_loop_error_handler(_loop, _name)
@@ -162,6 +164,8 @@ async def on_ready():
         tasks_bg.commitment_followup_check.start()
     if not tasks_bg.poll_followup_check.is_running():
         tasks_bg.poll_followup_check.start()
+    if not tasks_bg.trip_scheduler_check.is_running():
+        tasks_bg.trip_scheduler_check.start()
 
 
 @discord_client.event
@@ -256,8 +260,8 @@ async def on_message(message):
     if state.current_life_slot:
         is_sleeping = state.current_life_slot.get("availability") == "asleep"
         if is_sleeping:
-            london_hour = datetime.now(ZoneInfo("Europe/London")).hour
-            sleep_phase = "deep" if 1 <= london_hour < 4 else "light"
+            local_hour = config.get_london_hour()
+            sleep_phase = "deep" if 1 <= local_hour < 4 else "light"
     sleep_mode = ""  # 传给 AI 的睡眠状态提示
 
     if is_dm:
@@ -551,16 +555,18 @@ async def on_message(message):
             ephemeral_parts.append(ph)
 
     # 睡眠模式：注入迷糊回复提示
+    # 深夜按他此刻所在地算，出差时是目的地的深夜。
+    where_now = trips.current_location()["city_cn"]
     if sleep_mode == "drowsy_deep":
         ephemeral_parts.append(
-            "\n（系统隐秘提示：你现在在伦敦，已经是深夜了，你本来已经睡着了但被消息吵醒。"
+            f"\n（系统隐秘提示：你现在在{where_now}，已经是深夜了，你本来已经睡着了但被消息吵醒。"
             "你迷迷糊糊的，回复极其简短——一两句话，可能有错字或断句不完整，像是半梦半醒摸到手机敲的。"
             "不要提你「被设定为睡觉」或任何系统机制，就自然地表现出困意。"
             "可以用省略号、断句、少量错字来体现。不需要双语，随便用一种语言就行。）"
         )
     elif sleep_mode == "drowsy_light":
         ephemeral_parts.append(
-            "\n（系统隐秘提示：你现在在伦敦，很晚了快要睡着、或者刚刚醒来还没完全清醒。"
+            f"\n（系统隐秘提示：你现在在{where_now}，很晚了快要睡着、或者刚刚醒来还没完全清醒。"
             "回复简短，带一点困意，像真人深夜/清晨发消息那样——句子可以短一些，语气比平时更软更随意。"
             "仍然保持双语格式，但可以更简短。）"
         )
@@ -862,7 +868,7 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
         return
 
     try:
-        time_ctx = config.get_beijing_time_note()
+        time_ctx = config.get_beijing_time_note() + state.trip_hint_text()
         prompt = (
             f"（系统提示：{time_ctx} 恋人刚刚从离线状态上线了。你注意到了。"
             "你可以选择：① 给她发一条极短的私信；"

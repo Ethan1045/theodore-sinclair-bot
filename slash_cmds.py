@@ -12,6 +12,7 @@ from discord import app_commands
 import config
 import state
 import tasks_bg
+import trips
 from client import discord_client, slash_tree
 from ai_client import call_ai
 from history import get_history, history_key_for, trim_history, delete_persisted_history, _msg_to_plain_text
@@ -697,7 +698,7 @@ async def slash_diary(interaction: discord.Interaction):
         await interaction.response.send_message("这个功能目前只有恋人能用。", ephemeral=True)
         return
     await interaction.response.defer()
-    time_ctx = config.get_beijing_time_note()
+    time_ctx = config.get_beijing_time_note() + trips.trip_hint_text()
     tmp = get_history(history_key_for(interaction=interaction)).copy()
     tmp.append({"role": "user", "content": (
         f"（系统提示：{time_ctx} 恋人悄悄翻开了你今天的日记。"
@@ -733,10 +734,10 @@ async def slash_card_now(interaction: discord.Interaction):
                 ephemeral=True,
             )
             return
-        now_london = datetime.now(ZoneInfo("Europe/London"))
-        weekday_en = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][now_london.weekday()]
+        now_local = trips.local_now()
+        weekday_en = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][now_local.weekday()]
         embed = discord.Embed(
-            title=f"— {now_london.strftime('%B %d')} · {weekday_en} —",
+            title=f"— {now_local.strftime('%B %d')} · {weekday_en} —",
             color=discord.Color(0x1e2330),
         )
         if data.get("location"):
@@ -750,7 +751,7 @@ async def slash_card_now(interaction: discord.Interaction):
         if data.get("note"):
             embed.add_field(name="​", value=f"*{data['note']}*", inline=False)
         embed.set_footer(text=data.get("footer", "T.S."))
-        thread_name = f"{now_london.strftime('%B %d')} · {weekday_en}"
+        thread_name = f"{now_local.strftime('%B %d')} · {weekday_en}"
         posted_to_forum = False
         if config.PROACTIVE_CHANNEL_ID:
             try:
@@ -764,7 +765,7 @@ async def slash_card_now(interaction: discord.Interaction):
             await interaction.followup.send(f"✅ 卡片已发送到论坛频道。", ephemeral=True)
         else:
             await interaction.followup.send(embed=embed)
-        print(f"✅ /card_now 手动触发卡片: {now_london.strftime('%Y-%m-%d %H:%M')}")
+        print(f"✅ /card_now 手动触发卡片: {now_local.strftime('%Y-%m-%d %H:%M')}")
     except Exception as e:
         await interaction.followup.send(f"❌ 生成失败：{e}", ephemeral=True)
 
@@ -1565,6 +1566,145 @@ async def bucket_clear(interaction: discord.Interaction, 桶名: str):
 @bucket_clear.autocomplete("桶名")
 async def _bucket_clear_ac(interaction: discord.Interaction, current: str):
     return await _bucket_autocomplete(interaction, current)
+
+
+# ==== 出差设置 ====
+def _trip_destination_choices() -> list[app_commands.Choice[str]]:
+    # Discord 最多 25 个选项；目的地列表远少于这个数。
+    return [
+        app_commands.Choice(name=f"{d['city_cn']} {d['city_en']}", value=d["code"])
+        for d in trips.TRIP_DESTINATIONS[:25]
+    ]
+
+
+@slash_tree.command(name="trip", description="恋人专属：查看或调整 T.S. 的随机出差")
+@app_commands.describe(
+    启用随机出差="是否让他偶尔自己决定出差（关掉不会中断已在进行的行程）",
+    立刻出发="立刻出发去指定城市",
+    随机出发="立刻随机挑一个城市出发",
+    出差天数="本次出差多少天（0.5~30，留空则随机）",
+    出差事由="本次出差的事由（留空则按城市自动挑一个）",
+    立刻返程="立刻结束当前出差，回伦敦",
+    平均频率="平均每天出发的概率（0~1，例如 0.08 约等于十二天一趟）",
+    最少天数="随机出差最少几天（0.5~30）",
+    最多天数="随机出差最多几天（0.5~30）",
+    最小间隔天数="两趟出差之间至少隔几天（0~90）",
+)
+@app_commands.choices(立刻出发=_trip_destination_choices())
+async def slash_trip_config(
+    interaction: discord.Interaction,
+    启用随机出差: bool | None = None,
+    立刻出发: app_commands.Choice[str] | None = None,
+    随机出发: bool = False,
+    出差天数: float | None = None,
+    出差事由: str | None = None,
+    立刻返程: bool = False,
+    平均频率: float | None = None,
+    最少天数: float | None = None,
+    最多天数: float | None = None,
+    最小间隔天数: float | None = None,
+):
+    if interaction.user.id != config.PARTNER_USER_ID:
+        await interaction.response.send_message("这个指令只有恋人能用。", ephemeral=True)
+        return
+    if (立刻出发 is not None or 随机出发) and 立刻返程:
+        await interaction.response.send_message("不能同时让他出发又让他返程。", ephemeral=True)
+        return
+    for label, value, low, high in (
+        ("平均频率", 平均频率, 0.0, 1.0),
+        ("出差天数", 出差天数, 0.5, 30.0),
+        ("最少天数", 最少天数, 0.5, 30.0),
+        ("最多天数", 最多天数, 0.5, 30.0),
+        ("最小间隔天数", 最小间隔天数, 0.0, 90.0),
+    ):
+        if value is not None and not (low <= value <= high):
+            await interaction.response.send_message(f"`{label}` 必须在 {low:g}~{high:g} 之间。", ephemeral=True)
+            return
+    new_min = trips.TRIP_MIN_DAYS if 最少天数 is None else float(最少天数)
+    new_max = trips.TRIP_MAX_DAYS if 最多天数 is None else float(最多天数)
+    if new_min > new_max:
+        await interaction.response.send_message("`最少天数` 不能大于 `最多天数`。", ephemeral=True)
+        return
+    if 出差事由 is not None and len(出差事由.strip()) > 200:
+        await interaction.response.send_message("出差事由最多 200 字。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    updates: dict[str, object] = {}
+    changes: list[str] = []
+    if 启用随机出差 is not None:
+        trips.TRIP_ENABLED = bool(启用随机出差)
+        updates["TRIP_ENABLED"] = trips.TRIP_ENABLED
+        changes.append(f"随机出差 → {'开' if trips.TRIP_ENABLED else '关'}")
+    for label, value, key in (
+        ("平均频率", 平均频率, "TRIP_CHANCE_PER_DAY"),
+        ("最少天数", 最少天数, "TRIP_MIN_DAYS"),
+        ("最多天数", 最多天数, "TRIP_MAX_DAYS"),
+        ("最小间隔天数", 最小间隔天数, "TRIP_MIN_GAP_DAYS"),
+    ):
+        if value is not None:
+            setattr(trips, key, float(value))
+            updates[key] = float(value)
+            changes.append(f"{label} → {float(value):g}")
+    if updates:
+        await save_persisted_config(updates)
+
+    if 立刻返程:
+        if trips.active_trip():
+            await trips.end_trip("手动召回")
+            changes.append("已立刻返程回伦敦")
+        else:
+            changes.append("他本来就在伦敦，无需返程")
+    elif 立刻出发 is not None or 随机出发:
+        destination = (
+            trips.destination_by_code(立刻出发.value) if 立刻出发 is not None else trips.pick_destination()
+        )
+        if destination is None:
+            await interaction.followup.send("❌ 找不到这个城市。", ephemeral=True)
+            return
+        if trips.active_trip():
+            await trips.end_trip("改派新行程")
+        await trips.start_trip(destination, 出差天数, (出差事由 or "").strip())
+        changes.append(f"已立刻出发去{destination['city_cn']}")
+
+    beijing_now = datetime.now(ZoneInfo("Asia/Shanghai"))
+    trip = trips.active_trip()
+    if trip:
+        zone = ZoneInfo(trip["tz"])
+        where = (
+            f"✈️ 正在{trip['city_cn']}（{trip['city_en']}）"
+            f"｜事由：{trip['purpose'] or '未注明'}"
+            f"\n- 他的当地时间：{datetime.now(zone).strftime('%m-%d %H:%M')}（{trip['tz']}）"
+            f"｜你这边（北京）：{beijing_now.strftime('%m-%d %H:%M')}"
+            f"\n- 返程：{trip['end'].astimezone(zone).strftime('%m-%d %H:%M')} 当地时间"
+        )
+    else:
+        where = (
+            f"🏠 在伦敦｜当地时间 {trips.local_now().strftime('%m-%d %H:%M')}"
+            f"｜你这边（北京）：{beijing_now.strftime('%m-%d %H:%M')}"
+        )
+    recent = [
+        (trips.destination_by_code(c) or {}).get("city_cn", c)
+        for c in (trips.state_snapshot().get("recent") or [])
+    ]
+    frequency = (
+        f"- 平均频率：每天 {trips.TRIP_CHANCE_PER_DAY:g} 的概率出发（约 {1 / trips.TRIP_CHANCE_PER_DAY:.0f} 天一趟）"
+        if trips.TRIP_CHANCE_PER_DAY > 0 else "- 平均频率：0（不会自己出发）"
+    )
+    lines = [
+        "**✈️ 当前出差配置**",
+        f"- {where}",
+        f"- 随机出差：{'✅开启' if trips.TRIP_ENABLED else '❌关闭（只影响他自己出发，不影响你手动派出的行程）'}",
+        frequency,
+        f"- 单趟时长：{trips.TRIP_MIN_DAYS:g}~{trips.TRIP_MAX_DAYS:g} 天，两趟之间至少隔 {trips.TRIP_MIN_GAP_DAYS:g} 天",
+        f"- 可去的城市：{len(trips.TRIP_DESTINATIONS)} 个",
+        f"- 最近去过：{'、'.join(recent) or '无记录'}",
+        "-# 出差期间他的时区和 Discord 状态都跟着目的地走；你始终按北京时间。",
+    ]
+    if changes:
+        lines.insert(0, "✅ 已更新：" + "；".join(changes) + "\n")
+    await interaction.followup.send("\n".join(lines)[:2000], ephemeral=True)
 
 
 slash_tree.add_command(memory_group)

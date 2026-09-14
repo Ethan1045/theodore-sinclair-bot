@@ -25,6 +25,7 @@ from presence import generate_presence, generate_custom_bubble, _TYPE_MAP
 from followups import check_due_followups
 from polls import check_ended_polls
 from life_state import refresh_life_state
+import trips
 
 # ==== 可通过 /post_config 实时修改的参数 ====
 DAILY_CARD_PROB_NORMAL = 0.35
@@ -152,16 +153,17 @@ async def generate_daily_card_data(weather: str | None = None) -> dict | None:
     time_ctx = get_beijing_time_note()
     occasion = get_today_occasion()
     occasion_hint = f"今天是{occasion}。" if occasion else ""
-    weather_hint = f"伦敦实时天气：{weather}。" if weather else ""
+    location = trips.current_location()
+    weather_hint = f"{location['city_cn']}实时天气：{weather}。" if weather else ""
 
     prompt = (
-        f"{time_ctx}\n{occasion_hint}{weather_hint}"
+        f"{time_ctx}{trips.trip_hint_text()}\n{occasion_hint}{weather_hint}"
         "请为T.S.（Theodore Sinclair / 沈玘言）生成今日状态卡片的内容。\n"
         "以他的视角，用简短、克制的语言填写以下字段。\n\n"
         "【双语规则（极其重要）】\n"
         "每个字段必须采用「英文 — 中文」双语格式，用空格 + em dash + 空格连接。\n\n"
         "【字段说明（每个字段都要双语）】\n"
-        "location: 当前所在地（不超过30字）\n"
+        f"location: 当前所在地（不超过30字，此刻你在{location['city_cn']}，必须与此一致）\n"
         "reading: 今天在读的书或文件，真实书名+作者（不超过30字）\n"
         "listening: 今天在听的音乐，艺术家+曲名/专辑（不超过30字）\n"
         "note: 今日一句话碎念/感受（不超过50字，双语）\n"
@@ -245,7 +247,8 @@ async def proactive_dm_partner():
         from datetime import timezone
         from ai_client import call_ai
         partner = await discord_client.fetch_user(config.PARTNER_USER_ID)
-        time_ctx = config.get_beijing_time_note()
+        # 出差时把位置一并交代清楚，免得他人在东京却说「伦敦今天下雨」。
+        time_ctx = config.get_beijing_time_note() + trips.trip_hint_text()
 
         FORMAT_REMINDER = (
             "【⚠️格式硬约束（不允许妥协）】"
@@ -338,7 +341,8 @@ async def anniversary_check():
                 await conn.commit()
 
         partner = await discord_client.fetch_user(config.PARTNER_USER_ID)
-        time_ctx = config.get_beijing_time_note()
+        # 出差时把位置一并交代清楚，免得他人在东京却说「伦敦今天下雨」。
+        time_ctx = config.get_beijing_time_note() + trips.trip_hint_text()
         FORMAT_REMINDER = (
             "【⚠️格式硬约束】每条严格两行：第一行英文，第二行中文翻译括起来，"
             "多条之间用 [SPLIT] 单独占一行分隔。不允许出现 [REACTION:...]。"
@@ -682,7 +686,8 @@ async def daily_occasion_check():
     try:
         from ai_client import call_ai
         channel = await discord_client.fetch_channel(config.PROACTIVE_CHANNEL_ID)
-        time_ctx = config.get_beijing_time_note()
+        # 出差时把位置一并交代清楚，免得他人在东京却说「伦敦今天下雨」。
+        time_ctx = config.get_beijing_time_note() + trips.trip_hint_text()
 
         if is_partner_birthday:
             prompt = (
@@ -721,11 +726,12 @@ async def daily_status_card():
     if not config.PROACTIVE_CHANNEL_ID:
         return
 
-    now_london = datetime.now(ZoneInfo("Europe/London"))
-    if now_london.hour != 9:
+    # 卡片按他当地时间的早上 9 点发；出差时跟着目的地走。
+    now_local = trips.local_now()
+    if now_local.hour != 9:
         return
 
-    today_key = now_london.strftime("%Y-%m-%d")
+    today_key = now_local.strftime("%Y-%m-%d")
     if _last_daily_card_date == today_key:
         return
     _last_daily_card_date = today_key
@@ -740,17 +746,18 @@ async def daily_status_card():
         return
 
     try:
-        from presence import get_london_weather
-        weather = await get_london_weather()
+        from presence import get_city_weather
+        location = trips.current_location()
+        weather = await get_city_weather(location["city_en"])
         data = await generate_daily_card_data(weather=weather)
         if not data:
             return
 
-        now_london = datetime.now(ZoneInfo("Europe/London"))
-        weekday_en = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][now_london.weekday()]
+        now_local = trips.local_now()
+        weekday_en = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][now_local.weekday()]
 
         embed = discord.Embed(
-            title=f"— {now_london.strftime('%B %d')} · {weekday_en} —",
+            title=f"— {now_local.strftime('%B %d')} · {weekday_en} —",
             color=discord.Color(0x1e2330),
         )
         if data.get("location"):
@@ -766,7 +773,7 @@ async def daily_status_card():
         embed.set_footer(text=data.get("footer", "T.S."))
 
         channel = await discord_client.fetch_channel(config.PROACTIVE_CHANNEL_ID)
-        thread_name = f"{now_london.strftime('%B %d')} · {weekday_en}"
+        thread_name = f"{now_local.strftime('%B %d')} · {weekday_en}"
         if isinstance(channel, discord.ForumChannel):
             await channel.create_thread(name=thread_name, embed=embed, auto_archive_duration=1440)
         else:
@@ -915,6 +922,13 @@ def _should_rotate_presence() -> bool:
     return elapsed >= threshold
 
 
+@tasks.loop(hours=trips.TRIP_CHECK_INTERVAL_HOURS)
+async def trip_scheduler_check():
+    """结束到期的出差，并偶尔开始一趟新的。"""
+    await discord_client.wait_until_ready()
+    await trips.scheduler_tick()
+
+
 async def _wakeup_catchup():
     """睡醒后补回复：把睡眠期间收到的消息打包，按频道分组，逐个补回复。"""
     pending = list(state.sleep_pending_messages)
@@ -948,7 +962,8 @@ async def _wakeup_catchup():
             except Exception:
                 pass
 
-            time_ctx = config.get_beijing_time_note()
+            # 出差时把位置一并交代清楚，免得他人在东京却说「伦敦今天下雨」。
+            time_ctx = config.get_beijing_time_note() + trips.trip_hint_text()
             FORMAT_REMINDER = (
                 "【⚠️格式硬约束（不允许妥协）】"
                 "1) 每一条消息严格两行：第一行英文，第二行中文翻译用括号括起来。"
@@ -1053,7 +1068,8 @@ async def random_forum_post():
         if not isinstance(channel, discord.ForumChannel):
             return
 
-        time_ctx = config.get_beijing_time_note()
+        # 出差时把位置一并交代清楚，免得他人在东京却说「伦敦今天下雨」。
+        time_ctx = config.get_beijing_time_note() + trips.trip_hint_text()
         prompt = (
             f"（系统提示：{time_ctx} 你现在打开了自己的论坛频道，想随手发一个帖子。\n"
             f"{state.life_hint_text()}\n"
@@ -1161,7 +1177,8 @@ async def forum_interaction():
                     reply_parts.append(f"{author}: {m.content[:100]}")
                 recent_replies = "\n最近的回复：\n" + "\n".join(reply_parts)
 
-            time_ctx = config.get_beijing_time_note()
+            # 出差时把位置一并交代清楚，免得他人在东京却说「伦敦今天下雨」。
+            time_ctx = config.get_beijing_time_note() + trips.trip_hint_text()
             prompt = (
                 f"（系统提示：{time_ctx} 你在论坛上看到一个帖子。\n"
                 f"标题：{target.name}\n"

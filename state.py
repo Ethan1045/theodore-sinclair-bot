@@ -113,14 +113,26 @@ user_typing_at: dict[tuple[int, int], float] = {}
 # ==== 持久化每日生活状态机 ====
 daily_life_date = None
 daily_life_schedule: list[dict] = []
+# 生成当前这份日程时他所在的行程代号（""＝在伦敦）。出发/返程时用来判定旧日程作废。
+daily_life_trip: str = ""
 current_life_slot: dict | None = None
 
 
+def trip_hint_text() -> str:
+    """他此刻是否在出差。state 不该有硬依赖，所以局部 import，失败就当他在家。"""
+    try:
+        import trips
+        return trips.trip_hint_text()
+    except Exception:
+        return ""
+
+
 def life_hint_text() -> str:
+    trip_hint = trip_hint_text()
     slot = current_life_slot or {}
     label = (slot.get("label") or "").strip()
     if not label:
-        return ""
+        return trip_hint
     availability = slot.get("availability", "available")
     availability_cn = {
         "busy": "目前不便长聊",
@@ -130,8 +142,10 @@ def life_hint_text() -> str:
     }.get(availability, "目前可以正常聊天")
     proactive = (slot.get("proactive") or "").strip()
     proactive_hint = f"若你主动开口，可以自然从「{proactive}」生发，但不要硬提。" if proactive else ""
-    return (
-        f"\n（系统背景：按照你今天已经确定的伦敦日程，你此刻{label}，{availability_cn}。"
+    city = (slot.get("city") or "伦敦").strip()
+    where = f"{city}日程" if slot.get("is_trip") else "伦敦日程"
+    return trip_hint + (
+        f"\n（系统背景：按照你今天已经确定的{where}，你此刻{label}，{availability_cn}。"
         f"回复、主动消息和状态栏必须与这件事一致；不要编造互相冲突的当前位置或活动。{proactive_hint}）"
     )
 

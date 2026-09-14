@@ -1,4 +1,8 @@
-"""Persistent London-day schedule used by presence, replies and proactive tasks."""
+"""Persistent daily schedule used by presence, replies and proactive tasks.
+
+平时是伦敦的一天；出差期间整张日程换成出差版本，时段按目的地当地时间排，
+状态栏也带上那座城市。出发/返程会让当天剩下的日程作废并重建。
+"""
 from __future__ import annotations
 
 import json
@@ -10,6 +14,7 @@ import discord
 
 import config
 import state
+import trips
 import db as _db
 from client import discord_client
 from presence import generate_custom_bubble
@@ -46,9 +51,46 @@ def _slot(start: str, end: str, key: str, label: str, kind: str, presence: str,
     }
 
 
-def _build_schedule(now: datetime) -> list[dict]:
+def _build_trip_schedule(rng: random.Random, destination: dict) -> list[dict]:
+    """出差的一天：按目的地当地时间排，白天在会议/工坊里，夜里在酒店。
+
+    比在家那套更「不便长聊」，但晚上留出完整的可聊时段——人在外地不等于消失。
+    """
+    day_text, day_label = destination["day"]
+    night_text, night_label = destination["night"]
+    city_cn, city_en = destination["city_cn"], destination["city_en"]
+    extra_kind, extra_text, extra_label = rng.choice(trips.TRIP_ANCHOR_EXTRA)
+    dinner = rng.choice([
+        _slot("18:00", "21:00", "trip_dinner", "和当地的人吃晚饭", "watching",
+              f"{city_en}, evening", "limited", "饭桌上听来的一句话"),
+        _slot("18:00", "21:00", "trip_dinner", f"推掉了应酬，自己在{city_cn}走了走", "watching",
+              f"{city_en}, evening", "available", f"{city_cn}街上看到的东西"),
+    ])
+    return [
+        _slot("00:00", "07:00", "sleep", f"在{city_cn}的酒店里睡觉", "custom", "sleeping", "asleep"),
+        _slot("07:00", "09:00", "trip_morning", f"{city_cn}的清晨，倒时差、看邮件", "custom", "",
+              "available", "时差和窗外的天色"),
+        # 用 limited 而不是 busy：在家的工作时段也是 limited，人在外地不该比在家更难找到他。
+        _slot("09:00", "12:30", "trip_day", day_label, "playing", day_text, "limited"),
+        _slot("12:30", "13:30", "trip_lunch", "会议间隙，一个人吃午饭", extra_kind, extra_text,
+              "available", "两场会之间的空档"),
+        _slot("13:30", "16:00", "trip_day_pm", day_label, "playing", day_text, "limited"),
+        _slot("16:00", "18:00", "trip_between", extra_label, extra_kind, extra_text, "limited"),
+        dinner,
+        # 夜里这段留成完整的可聊时段：和在家的日程一样，晚上是他真正有空的时候。
+        _slot("21:00", "23:30", "trip_night", night_label, "playing", night_text,
+              "available", f"{city_cn}的夜里"),
+        _slot("23:30", "23:59", "trip_wind_down", f"在{city_cn}写日记、准备休息", "custom",
+              "winding down…", "limited"),
+    ]
+
+
+def _build_schedule(now: datetime, trip_code: str = "") -> list[dict]:
     """Generate one coherent day. Random choices are date-seeded and therefore stable."""
-    rng = random.Random(f"life:{now.date().isoformat()}:{config.PARTNER_USER_ID}")
+    rng = random.Random(f"life:{now.date().isoformat()}:{trip_code}:{config.PARTNER_USER_ID}")
+    destination = trips.destination_by_code(trip_code)
+    if destination:
+        return _build_trip_schedule(rng, destination)
     music = rng.choice([
         "Bill Evans — Peace Piece", "Chet Baker — Almost Blue",
         "Bach — Goldberg Variations", "Ryuichi Sakamoto — async",
@@ -85,9 +127,32 @@ def _build_schedule(now: datetime) -> list[dict]:
     return slots
 
 
+def _wrap_schedule(slots: list[dict], trip_code: str) -> dict:
+    """落库格式：带上行程代号，好让出发/返程当天认出旧日程已经作废。"""
+    return {"trip": trip_code or "", "slots": slots}
+
+
+def _unwrap_schedule(stored) -> tuple[list[dict], str]:
+    """兼容早期只存一个 slot 列表的行：那时候还没有出差，一律当作在家。"""
+    if isinstance(stored, str):
+        stored = json.loads(stored)
+    if isinstance(stored, list):
+        return stored, ""
+    if isinstance(stored, dict):
+        slots = stored.get("slots")
+        if isinstance(slots, list):
+            return slots, str(stored.get("trip") or "")
+    return [], ""
+
+
 async def _load_or_create_schedule(now: datetime) -> list[dict]:
     day = now.date()
-    if state.daily_life_date == day and state.daily_life_schedule:
+    trip_code = trips.trip_code()
+    if (
+        state.daily_life_date == day
+        and state.daily_life_schedule
+        and state.daily_life_trip == trip_code
+    ):
         return state.daily_life_schedule
 
     schedule = None
@@ -100,24 +165,26 @@ async def _load_or_create_schedule(now: datetime) -> list[dict]:
                         (day,),
                     )
                     row = await cur.fetchone()
-                    if row:
-                        schedule = row[0]
-                        if isinstance(schedule, str):
-                            schedule = json.loads(schedule)
+                    stored_slots, stored_trip = _unwrap_schedule(row[0]) if row else ([], "")
+                    if stored_slots and stored_trip == trip_code:
+                        schedule = stored_slots
                     else:
-                        schedule = _build_schedule(now)
+                        # 没存过，或者出差状态变了（出发/返程）：当天剩下的时间换一套日程。
+                        schedule = _build_schedule(now, trip_code)
                         await cur.execute(
                             "INSERT INTO daily_life_schedules(schedule_date, schedule_json) VALUES(%s, %s::jsonb) "
-                            "ON CONFLICT(schedule_date) DO NOTHING",
-                            (day, json.dumps(schedule, ensure_ascii=False)),
+                            "ON CONFLICT(schedule_date) DO UPDATE "
+                            "SET schedule_json=EXCLUDED.schedule_json, updated_at=NOW()",
+                            (day, json.dumps(_wrap_schedule(schedule, trip_code), ensure_ascii=False)),
                         )
                         await conn.commit()
         except Exception as exc:
             print(f"⚠️ 每日日程读写失败，使用进程内日程: {exc}")
     if not schedule:
-        schedule = _build_schedule(now)
+        schedule = _build_schedule(now, trip_code)
     state.daily_life_date = day
     state.daily_life_schedule = schedule
+    state.daily_life_trip = trip_code
     return schedule
 
 
@@ -135,21 +202,27 @@ def _current_slot(schedule: list[dict], now: datetime) -> dict:
     return schedule[-1]
 
 
-def slot_end_utc(slot: dict, now_london: datetime) -> datetime:
+def slot_end_utc(slot: dict, now_local: datetime) -> datetime:
+    """时段结束时刻。日程按他当地时间排，所以这里用他此刻所在地的时区。"""
     h, m = (int(x) for x in slot["end"].split(":"))
-    end = datetime.combine(now_london.date(), time(h, m), tzinfo=LONDON)
-    if end <= now_london:
+    end = datetime.combine(now_local.date(), time(h, m), tzinfo=now_local.tzinfo or LONDON)
+    if end <= now_local:
         end += timedelta(days=1)
     return end.astimezone(timezone.utc)
 
 
 async def refresh_life_state(*, force_presence: bool = False) -> tuple[dict, bool]:
-    now = datetime.now(LONDON)
+    # 出差时这是目的地的当地时间，在家时就是伦敦时间。
+    now = trips.local_now()
     schedule = await _load_or_create_schedule(now)
     slot = _current_slot(schedule, now)
+    location = trips.current_location()
     old_key = (state.current_life_slot or {}).get("key")
-    changed = old_key != slot.get("key")
-    state.current_life_slot = dict(slot)
+    old_city = (state.current_life_slot or {}).get("city") or ""
+    # 换城市也算「换了状态」：出发/返程当下就要把 presence 顶掉，而不是等下一个时段。
+    changed = old_key != slot.get("key") or old_city != location["city_cn"]
+    # 注意 slot 仍然是 schedule 里的那个 dict：下面生成气泡时要写回它再落库。
+    state.current_life_slot = {**slot, "city": location["city_cn"], "is_trip": location["is_trip"]}
 
     if slot.get("availability") == "busy":
         state.work_busy_activity = slot["label"]
@@ -170,7 +243,8 @@ async def refresh_life_state(*, force_presence: bool = False) -> tuple[dict, boo
                             await cur.execute(
                                 "UPDATE daily_life_schedules SET schedule_json=%s::jsonb, updated_at=NOW() "
                                 "WHERE schedule_date=%s",
-                                (json.dumps(schedule, ensure_ascii=False), now.date()),
+                                (json.dumps(_wrap_schedule(schedule, trips.trip_code()), ensure_ascii=False),
+                                 now.date()),
                             )
                             await conn.commit()
                 except Exception as exc:
