@@ -140,8 +140,33 @@ python bot.py
 
 ---
 
+## 出差系统
+
+T.S. 平时在伦敦，但会偶尔出差几天（平均约十二天一趟，2~6 天）。
+
+出差期间他的**当地时区跟着目的地走**：状态栏、每日卡片、他说「今天/今晚/该睡了」
+时的判断，全部按目的地时间算；**你始终按北京时间**，所以你俩的时差会变，他也知道这一点。
+他不会刻意宣布行程，只在自然相关时（时差、窗外、手边的事）带一句。
+
+用 `/trip` 查看和调整（只有 `PARTNER_USER_ID` 能用）：
+
+| 参数 | 作用 |
+|---|---|
+| `启用随机出差` | 关掉后他不再自己决定出发；已在进行的行程不受影响 |
+| `立刻出发` / `随机出发` | 立刻把他派去某座城市 |
+| `出差天数` / `出差事由` | 本次行程的时长与事由（留空则随机） |
+| `立刻返程` | 立刻结束当前行程回伦敦 |
+| `平均频率` / `最少天数` / `最多天数` / `最小间隔天数` | 随机出差的节奏 |
+
+开关、参数和当前行程都写进 `bot_config` 表，重启不丢；没配 `DATABASE_URL` 时
+仍然能跑，只是重启后他会回到伦敦。
+
+**想换成自己的城市**：编辑 `trips.py` 的 `TRIP_DESTINATIONS`，每个条目是
+`code / city_cn / city_en / tz（IANA 时区名）/ purposes（事由候选）/ day / night（状态栏文案）`。
+
 ## 想关掉的功能
 
+- **关掉随机出差**：在 Discord 里跑 `/trip 启用随机出差:False`；要把正在外面的他叫回来，再跑一次 `/trip 立刻返程:True`。
 - **关掉 NSFW / dom-sub**：直接编辑 `prompts.py` 第二个大段（`【你和她的关系】` 和 `关于 NSFW：`），删掉相关句子即可。重启就生效。
 - **关掉每日状态卡片 / 公屏节日发言**：在 Discord 里跑 `/post_config 启用每日卡:关`，或者直接不设 `PROACTIVE_CHANNEL_ID`。
 - **关掉主动私信**：在 `events.py` 的 `on_ready` 里注释掉 `tasks_bg.proactive_dm_partner.start()`，或者把它改成更低频率。
@@ -171,6 +196,7 @@ ai_client.py        OpenAI 客户端、限流、token 预算
 actions.py          [ACTION]...[/ACTION] 解析与执行
 directives.py       AI 输出指令块解析（纯函数）
 presence.py         Discord 头像状态/活动状态生成
+trips.py            随机出差系统（目的地、行程状态、时区跟随、调度）
 reply.py            消息分段发送
 db.py               Postgres 连接池
 requirements.txt
@@ -187,7 +213,7 @@ partner_profile.example.md
 - 提醒持久化（`reminders` 表，重启不丢）
 - 对话历史持久化（`conversation_histories` 表）
 - 金币/经验系统（`users` 表）
-- bot 配置持久化（`bot_config` 表）
+- bot 配置持久化（`bot_config` 表，也包括当前出差行程）
 
 不配也能跑,但所有数据都存在内存里——**bot 一重启（托管平台随时可能重启你的服务）记忆、提醒、金币全部清零**。也就是说不配数据库的 T.S. 是「失忆体质」。
 

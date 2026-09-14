@@ -63,6 +63,15 @@ def presence_hint_text() -> str:
     )
 
 
+def trip_hint_text() -> str:
+    """他此刻是否在出差。state 不该有硬依赖，所以局部 import，失败就当他在家。"""
+    try:
+        import trips
+        return trips.trip_hint_text()
+    except Exception:
+        return ""
+
+
 # ==== 提醒系统 ====
 pending_reminders: list[dict] = []
 reminders_lock: "asyncio.Lock | None" = None

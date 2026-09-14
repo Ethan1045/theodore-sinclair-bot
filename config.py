@@ -171,12 +171,32 @@ def get_beijing_time_note() -> str:
     return f"（系统时间：北京时间现在是 {now.strftime('%Y-%m-%d')} {weekday_cn} {now.strftime('%H:%M')}。）"
 
 
+def his_now() -> datetime:
+    """他此刻的当地时间：出差时是目的地时间，平时是伦敦。
+
+    config 要保持「无内部依赖」，所以 trips 只在函数里局部 import；
+    任何异常都回落到伦敦，绝不让时间函数把整条链路带崩。
+    """
+    try:
+        import trips
+        return trips.local_now()
+    except Exception:
+        return datetime.now(ZoneInfo("Europe/London"))
+
+
 def get_presence_time_context() -> str:
-    now_london = datetime.now(ZoneInfo("Europe/London"))
+    """他的当地时间 + 恋人的北京时间。出差时前者跟着目的地走，后者永远是北京。"""
+    now_local = his_now()
     now_beijing = datetime.now(ZoneInfo("Asia/Shanghai"))
-    weekday_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][now_london.weekday()]
+    weekday_en = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][now_local.weekday()]
     weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now_beijing.weekday()]
+    city_en = "London"
+    try:
+        import trips
+        city_en = trips.current_location()["city_en"]
+    except Exception:
+        pass
     return (
-        f"(Your local time — London: {now_london.strftime('%Y-%m-%d')} {weekday_en} {now_london.strftime('%H:%M')}. "
+        f"(Your local time — {city_en}: {now_local.strftime('%Y-%m-%d')} {weekday_en} {now_local.strftime('%H:%M')}. "
         f"Your partner's time — Beijing: {now_beijing.strftime('%Y-%m-%d')} {weekday_cn} {now_beijing.strftime('%H:%M')}.)"
     )

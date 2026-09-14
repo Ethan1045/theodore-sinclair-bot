@@ -89,6 +89,7 @@ async def on_ready():
         (tasks_bg.persist_histories_task,   "persist_histories_task"),
         (tasks_bg.random_forum_post,        "random_forum_post"),
         (tasks_bg.forum_interaction,        "forum_interaction"),
+        (tasks_bg.trip_scheduler_check,     "trip_scheduler_check"),
     ):
         try:
             tasks_bg._attach_loop_error_handler(_loop, _name)
@@ -146,6 +147,8 @@ async def on_ready():
         tasks_bg.random_forum_post.start()
     if not tasks_bg.forum_interaction.is_running():
         tasks_bg.forum_interaction.start()
+    if not tasks_bg.trip_scheduler_check.is_running():
+        tasks_bg.trip_scheduler_check.start()
 
 
 @discord_client.event
@@ -411,6 +414,9 @@ async def on_message(message):
         )
 
     ephemeral_parts.append("\n" + config.get_beijing_time_note())
+    trip_ctx = state.trip_hint_text()
+    if trip_ctx:
+        ephemeral_parts.append(trip_ctx)
     emoji_ctx = get_guild_emoji_hint(message.guild)
     if emoji_ctx:
         ephemeral_parts.append(emoji_ctx)
@@ -736,7 +742,7 @@ async def on_presence_update(before: discord.Member, after: discord.Member):
         return
 
     try:
-        time_ctx = config.get_beijing_time_note()
+        time_ctx = config.get_beijing_time_note() + state.trip_hint_text()
         prompt = (
             f"（系统提示：{time_ctx} 恋人刚刚从离线状态上线了。你注意到了。"
             "你可以选择：① 给她发一条极短的私信；"

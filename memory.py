@@ -139,6 +139,12 @@ _PERSISTED_CONFIG_KEYS: dict[str, type] = {
     "CLEANUP_INTERVAL_HOURS": int,
     "CLEANUP_ENABLED": bool,
     "DAILY_CARD_ENABLED": bool,
+    "TRIP_ENABLED": bool,
+    "TRIP_CHANCE_PER_DAY": float,
+    "TRIP_MIN_DAYS": float,
+    "TRIP_MAX_DAYS": float,
+    "TRIP_MIN_GAP_DAYS": float,
+    "TRIP_STATE": str,
 }
 
 
@@ -194,6 +200,9 @@ def _apply_persisted_config(parsed: dict) -> None:
         tasks_bg.DAILY_CARD_ENABLED = parsed["DAILY_CARD_ENABLED"]
     if "RANDOM_POST_PROB" in parsed:
         tasks_bg.RANDOM_POST_PROB = parsed["RANDOM_POST_PROB"]
+    # 出差的开关、参数和当前行程都存在同一张 bot_config 里，交给 trips 自己解析。
+    import trips
+    trips.apply_persisted(parsed)
 
 
 async def save_persisted_config(updates: dict):
