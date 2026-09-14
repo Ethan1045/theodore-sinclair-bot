@@ -50,6 +50,28 @@ _VERB_TO_KIND = {
 }
 
 
+# ==== 状态栏轮换节奏（由 /presence 实时调整并落库，不用改代码）====
+# 锚定活动 = 他设定里真实会做的事，可以稳定挂一段时间，不花额度。
+# 瞬时气泡 = AI 现编的一句碎碎念；只在一个时段的开头挂一会儿就落回锚定活动，
+# 挂久了会变成「盯了四十分钟鸽子」。关掉 TRANSIENT_ENABLED 就完全不为状态栏调用 AI。
+ROTATION_ENABLED = True    # 关掉后状态栏定格在当前这个，不再自动更换
+ROTATE_MINUTES = 2         # 后台多久检查一次状态栏
+CLEARED = False            # 清空状态栏：什么都不显示，且完全不调用 AI
+TRANSIENT_ENABLED = True   # 瞬时气泡总开关
+TRANSIENT_CHANCE = 0.3     # 一个允许瞬时的时段里真正出现的概率
+TRANSIENT_MINUTES = 18     # 一句碎碎念最多挂多久，之后落回锚定活动
+
+
+async def clear_presence_bar() -> None:
+    """把 Discord 状态栏清空（什么都不显示）。停掉轮换时用，省额度也靠它。"""
+    try:
+        await discord_client.change_presence(status=discord.Status.idle, activity=None)
+        state.set_current_presence("", "", source="cleared")
+        print("🫥 状态栏已清空")
+    except Exception as exc:
+        print(f"⚠️ 清空状态栏失败: {exc}")
+
+
 def _presence_cooldown_ok() -> bool:
     if state.last_presence_change_at is None:
         return True
