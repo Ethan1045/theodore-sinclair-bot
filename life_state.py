@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 import discord
 
 import config
+import presence
 import state
 import trips
 import db as _db
@@ -43,11 +44,22 @@ async def ensure_life_schedule_table() -> None:
 
 
 def _slot(start: str, end: str, key: str, label: str, kind: str, presence: str,
-          availability: str = "available", proactive: str = "") -> dict:
+          availability: str = "available", proactive: str = "",
+          anchor: str = "", anchor_kind: str = "playing") -> dict:
+    """一个时段。
+
+    presence 为空的 custom 时段＝「这里挂一句 AI 现编的碎碎念」，气泡只在时段开头
+    挂 presence.TRANSIENT_MINUTES 分钟，之后落回 anchor 这个稳定的活动；
+    其余时段 anchor 就等于 presence，不涉及任何 AI 调用。
+    """
+    bubble = kind == "custom" and not presence
     return {
         "start": start, "end": end, "key": key, "label": label,
         "kind": kind, "presence": presence, "availability": availability,
         "proactive": proactive,
+        "bubble": bubble,
+        "anchor": anchor or presence,
+        "anchor_kind": anchor_kind if bubble else kind,
     }
 
 
@@ -69,7 +81,7 @@ def _build_trip_schedule(rng: random.Random, destination: dict) -> list[dict]:
     return [
         _slot("00:00", "07:00", "sleep", f"在{city_cn}的酒店里睡觉", "custom", "sleeping", "asleep"),
         _slot("07:00", "09:00", "trip_morning", f"{city_cn}的清晨，倒时差、看邮件", "custom", "",
-              "available", "时差和窗外的天色"),
+              "available", "时差和窗外的天色", anchor=f"{city_en}, morning"),
         # 用 limited 而不是 busy：在家的工作时段也是 limited，人在外地不该比在家更难找到他。
         _slot("09:00", "12:30", "trip_day", day_label, "playing", day_text, "limited"),
         _slot("12:30", "13:30", "trip_lunch", "会议间隙，一个人吃午饭", extra_kind, extra_text,
@@ -103,20 +115,24 @@ def _build_schedule(now: datetime, trip_code: str = "") -> list[dict]:
     if now.weekday() < 5:
         slots = [
             _slot("00:00", "05:30", "sleep", "在睡觉", "custom", "sleeping", "asleep"),
-            _slot("05:30", "07:30", "morning", "在家醒来、喝茶并看晨间文件", "custom", "", "available", "晨间天气或茶"),
+            _slot("05:30", "07:30", "morning", "在家醒来、喝茶并看晨间文件", "custom", "", "available",
+                  "晨间天气或茶", anchor="Morning papers"),
             _slot("07:30", "09:00", "commute", "去办公室的路上", "listening", music, "limited"),
             _slot("09:00", "12:30", "office_am", "在家族办公室处理文件与会议", "playing", "Family-office papers", "limited", "上午会议后的一个念头"),
-            _slot("12:30", "14:00", "lunch", "午餐并短暂离开办公桌", "custom", "", "available", "午餐间隙"),
+            _slot("12:30", "14:00", "lunch", "午餐并短暂离开办公桌", "custom", "", "available",
+                  "午餐间隙", anchor="Away from the desk"),
             _slot("14:00", "18:00", "foundation", "处理基金会与文保项目", "playing", "Foundation & archive work", "limited", "档案或修复工作"),
             _slot("18:00", "19:30", "return", "回家并整理当天的事", "listening", music, "limited"),
             evening,
-            _slot("21:00", "23:15", "study", "在书房，已经结束正式工作", "custom", "", "available", "书房里的小事"),
+            _slot("21:00", "23:15", "study", "在书房，已经结束正式工作", "custom", "", "available",
+                  "书房里的小事", anchor="In the study"),
             _slot("23:15", "23:59", "wind_down", "准备休息", "custom", "winding down…", "limited"),
         ]
     else:
         slots = [
             _slot("00:00", "06:30", "sleep", "在睡觉", "custom", "sleeping", "asleep"),
-            _slot("06:30", "09:30", "slow_morning", "在家过一个安静的早晨", "custom", "", "available", "周末早晨"),
+            _slot("06:30", "09:30", "slow_morning", "在家过一个安静的早晨", "custom", "", "available",
+                  "周末早晨", anchor="A slow morning"),
             _slot("09:30", "12:30", "estate", "处理私人信件和家中事务", "playing", "Letters & household papers", "limited"),
             _slot("12:30", "15:00", "lunch_walk", "午餐后在伦敦散步", "watching", "London, unhurried", "available", "沿路看到的事"),
             _slot("15:00", "18:30", "archive", "在档案室或书房阅读", "playing", "Archive afternoon", "limited", "旧纸与书"),
@@ -211,44 +227,93 @@ def slot_end_utc(slot: dict, now_local: datetime) -> datetime:
     return end.astimezone(timezone.utc)
 
 
-async def refresh_life_state(*, force_presence: bool = False) -> tuple[dict, bool]:
+def _transient_window_open(slot: dict, now_local: datetime) -> bool:
+    """这个时段此刻是否该挂那句 AI 碎碎念。
+
+    只在时段开头的 TRANSIENT_MINUTES 分钟内成立，过了就落回锚定活动；
+    开不开由「日期＋时段」的固定种子决定，不会在同一个时段里忽有忽无。
+    """
+    if not presence.TRANSIENT_ENABLED or presence.CLEARED:
+        return False
+    if not slot.get("bubble") or slot.get("availability") == "asleep":
+        return False
+    minutes_in = (now_local.hour * 60 + now_local.minute) - _minutes(slot["start"])
+    if not (0 <= minutes_in < presence.TRANSIENT_MINUTES):
+        return False
+    seed = f"{now_local.date().isoformat()}:{slot['key']}"
+    return random.Random(seed).random() < presence.TRANSIENT_CHANCE
+
+
+async def _bubble_text(slot: dict, schedule: list[dict], now: datetime) -> str:
+    """取这个时段的碎碎念；一天只生成一次，之后从日程里读回来。"""
+    text = slot.get("presence") or ""
+    if text:
+        return text
+    text = await generate_custom_bubble()
+    slot["presence"] = text
+    if config.DATABASE_URL:
+        try:
+            async with _db.db_conn() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE daily_life_schedules SET schedule_json=%s::jsonb, updated_at=NOW() "
+                        "WHERE schedule_date=%s",
+                        (json.dumps(_wrap_schedule(schedule, trips.trip_code()), ensure_ascii=False),
+                         now.date()),
+                    )
+                    await conn.commit()
+        except Exception as exc:
+            print(f"⚠️ 气泡状态持久化失败: {exc}")
+    return text
+
+
+async def refresh_life_state(*, force_presence: bool = False, force_bubble: bool = False) -> tuple[dict, bool]:
+    """刷新作息状态并把它反映到 Discord 状态栏。
+
+    force_bubble=True 是 /状态栏设置 的「立刻换一个」：不管瞬时窗口开没开，
+    都现生成一句新的碎碎念挂上去，否则同一个时段里重刷只会得到同一行字。
+    """
     # 出差时这是目的地的当地时间，在家时就是伦敦时间。
     now = trips.local_now()
     schedule = await _load_or_create_schedule(now)
     slot = _current_slot(schedule, now)
     location = trips.current_location()
-    old_key = (state.current_life_slot or {}).get("key")
-    old_city = (state.current_life_slot or {}).get("city") or ""
-    # 换城市也算「换了状态」：出发/返程当下就要把 presence 顶掉，而不是等下一个时段。
-    changed = old_key != slot.get("key") or old_city != location["city_cn"]
+    transient = _transient_window_open(slot, now)
+    if (
+        force_bubble and presence.TRANSIENT_ENABLED and not presence.CLEARED
+        and slot.get("bubble") and slot.get("availability") != "asleep"
+    ):
+        slot["presence"] = ""   # 丢掉今天缓存的那句，重新生成
+        transient = True
+    old = state.current_life_slot or {}
+    # 换城市、气泡过掉都算「换了状态」：出发/返程和碎碎念到点都要立刻反映到状态栏。
+    changed = (
+        old.get("key") != slot.get("key")
+        or (old.get("city") or "") != location["city_cn"]
+        or bool(old.get("transient")) != transient
+    )
     # 注意 slot 仍然是 schedule 里的那个 dict：下面生成气泡时要写回它再落库。
-    state.current_life_slot = {**slot, "city": location["city_cn"], "is_trip": location["is_trip"]}
+    state.current_life_slot = {
+        **slot, "city": location["city_cn"], "is_trip": location["is_trip"], "transient": transient,
+    }
 
     if slot.get("availability") == "busy":
         state.work_busy_activity = slot["label"]
         state.work_busy_until = slot_end_utc(slot, now)
 
+    # 状态栏停掉或清空时，上面的作息状态照常更新——提示词里的「你此刻在做什么」
+    # 和主动开口都读它，停的只是 Discord 那一栏。
+    if presence.CLEARED or not presence.ROTATION_ENABLED:
+        return state.current_life_slot, changed
+
     if changed or force_presence:
-        text = slot.get("presence", "")
-        kind = slot.get("kind", "playing")
-        if kind == "custom" and not text:
-            # The existing generator is now tied to selected day-plan transitions.
-            text = await generate_custom_bubble()
-            slot["presence"] = text
+        if transient:
+            kind = "custom"
+            text = await _bubble_text(slot, schedule, now)
             state.current_life_slot["presence"] = text
-            if config.DATABASE_URL:
-                try:
-                    async with _db.db_conn() as conn:
-                        async with conn.cursor() as cur:
-                            await cur.execute(
-                                "UPDATE daily_life_schedules SET schedule_json=%s::jsonb, updated_at=NOW() "
-                                "WHERE schedule_date=%s",
-                                (json.dumps(_wrap_schedule(schedule, trips.trip_code()), ensure_ascii=False),
-                                 now.date()),
-                            )
-                            await conn.commit()
-                except Exception as exc:
-                    print(f"⚠️ 气泡状态持久化失败: {exc}")
+        else:
+            kind = slot.get("anchor_kind") or slot.get("kind", "playing")
+            text = slot.get("anchor") or slot.get("presence") or "Quietly occupied"
         if kind == "custom":
             activity = discord.CustomActivity(name=text)
         else:
@@ -263,8 +328,11 @@ async def refresh_life_state(*, force_presence: bool = False) -> tuple[dict, boo
         status = discord.Status.idle if slot.get("availability") in {"busy", "limited", "asleep"} else discord.Status.online
         try:
             await discord_client.change_presence(status=status, activity=activity)
-            state.set_current_presence(kind, text, source=f"life:{slot['key']}", duration_type="sustained")
-            print(f"🗓️ 日程状态 → {slot['label']} [{kind}] {text}")
+            state.set_current_presence(
+                kind, text, source=f"life:{slot['key']}",
+                duration_type="instant" if transient else "sustained",
+            )
+            print(f"🗓️ 日程状态 → {slot['label']} [{kind}] {text}{'（瞬时）' if transient else ''}")
         except Exception as exc:
             print(f"⚠️ 日程 Presence 更新失败: {exc}")
     return state.current_life_slot, changed

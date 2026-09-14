@@ -123,6 +123,13 @@ async def on_ready():
         tasks_bg.cleanup_stale_forum_posts.change_interval(hours=tasks_bg.CLEANUP_INTERVAL_HOURS)
     except Exception:
         pass
+    # 这两个周期也是可配置的，落库的值要在启动时生效。
+    try:
+        import presence as presence_mod
+        tasks_bg.rotate_presence.change_interval(minutes=presence_mod.ROTATE_MINUTES)
+        tasks_bg.proactive_dm_partner.change_interval(hours=tasks_bg.PROACTIVE_DM_INTERVAL_HOURS)
+    except Exception as e:
+        print(f"⚠️ 调整状态栏/主动私信周期失败: {e}")
     try:
         synced = await slash_tree.sync()
         print(f"✅ Slash commands 已同步: {len(synced)} 条")

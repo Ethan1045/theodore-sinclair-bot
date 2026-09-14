@@ -13,6 +13,8 @@ import config
 import state
 import tasks_bg
 import trips
+import presence as presence_mod
+from life_state import refresh_life_state
 from client import discord_client, slash_tree
 from ai_client import call_ai
 from history import get_history, history_key_for, trim_history, delete_persisted_history, _msg_to_plain_text
@@ -1566,6 +1568,221 @@ async def bucket_clear(interaction: discord.Interaction, 桶名: str):
 @bucket_clear.autocomplete("桶名")
 async def _bucket_clear_ac(interaction: discord.Interaction, current: str):
     return await _bucket_autocomplete(interaction, current)
+
+
+# ==== 主动私信设置 ====
+@slash_tree.command(name="proactive_dm", description="恋人专属：控制 T.S. 会不会主动给你发私信")
+@app_commands.describe(
+    启用="总开关；关掉后他完全不会主动私信（你找他照常回）",
+    检查间隔小时="多久检查一次「要不要找她」（1~48）",
+    发送概率="每次检查真正发出去的概率（0~1）",
+    最少安静分钟="你安静满多久之后他才考虑主动开口（0~1440）",
+    深夜允许="北京时间 2~8 点是否允许他发",
+    深夜概率="深夜时段额外的一层概率（0~1）",
+    立即发送="马上让他发一条（不受概率和安静时长限制）",
+)
+async def slash_proactive_dm_config(
+    interaction: discord.Interaction,
+    启用: bool | None = None,
+    检查间隔小时: int | None = None,
+    发送概率: float | None = None,
+    最少安静分钟: int | None = None,
+    深夜允许: bool | None = None,
+    深夜概率: float | None = None,
+    立即发送: bool = False,
+):
+    if interaction.user.id != config.PARTNER_USER_ID:
+        await interaction.response.send_message("这个指令只有恋人能用。", ephemeral=True)
+        return
+    for label, value, low, high in (
+        ("检查间隔小时", 检查间隔小时, 1, 48),
+        ("最少安静分钟", 最少安静分钟, 0, 1440),
+    ):
+        if value is not None and not (low <= value <= high):
+            await interaction.response.send_message(f"`{label}` 必须在 {low}~{high} 之间。", ephemeral=True)
+            return
+    for label, value in (("发送概率", 发送概率), ("深夜概率", 深夜概率)):
+        if value is not None and not (0.0 <= value <= 1.0):
+            await interaction.response.send_message(f"`{label}` 必须在 0~1 之间。", ephemeral=True)
+            return
+
+    await interaction.response.defer(ephemeral=True)
+
+    updates: dict[str, object] = {}
+    changes: list[str] = []
+    if 启用 is not None:
+        tasks_bg.PROACTIVE_DM_ENABLED = bool(启用)
+        updates["PROACTIVE_DM_ENABLED"] = tasks_bg.PROACTIVE_DM_ENABLED
+        changes.append(f"主动私信 → {'开' if tasks_bg.PROACTIVE_DM_ENABLED else '关'}")
+    if 检查间隔小时 is not None:
+        tasks_bg.PROACTIVE_DM_INTERVAL_HOURS = int(检查间隔小时)
+        updates["PROACTIVE_DM_INTERVAL_HOURS"] = tasks_bg.PROACTIVE_DM_INTERVAL_HOURS
+        try:
+            tasks_bg.proactive_dm_partner.change_interval(hours=tasks_bg.PROACTIVE_DM_INTERVAL_HOURS)
+        except Exception as e:
+            print(f"⚠️ 调整主动私信间隔失败: {e}")
+        changes.append(f"检查间隔 → {tasks_bg.PROACTIVE_DM_INTERVAL_HOURS}h")
+    if 发送概率 is not None:
+        tasks_bg.PROACTIVE_DM_CHANCE = float(发送概率)
+        updates["PROACTIVE_DM_CHANCE"] = tasks_bg.PROACTIVE_DM_CHANCE
+        changes.append(f"发送概率 → {tasks_bg.PROACTIVE_DM_CHANCE:g}")
+    if 最少安静分钟 is not None:
+        tasks_bg.PROACTIVE_DM_MIN_IDLE_MINUTES = int(最少安静分钟)
+        updates["PROACTIVE_DM_MIN_IDLE_MINUTES"] = tasks_bg.PROACTIVE_DM_MIN_IDLE_MINUTES
+        changes.append(f"最少安静 → {tasks_bg.PROACTIVE_DM_MIN_IDLE_MINUTES} 分钟")
+    if 深夜允许 is not None:
+        tasks_bg.PROACTIVE_DM_LATE_NIGHT = bool(深夜允许)
+        updates["PROACTIVE_DM_LATE_NIGHT"] = tasks_bg.PROACTIVE_DM_LATE_NIGHT
+        changes.append(f"深夜 → {'允许' if tasks_bg.PROACTIVE_DM_LATE_NIGHT else '不允许'}")
+    if 深夜概率 is not None:
+        tasks_bg.PROACTIVE_DM_LATE_CHANCE = float(深夜概率)
+        updates["PROACTIVE_DM_LATE_CHANCE"] = tasks_bg.PROACTIVE_DM_LATE_CHANCE
+        changes.append(f"深夜概率 → {tasks_bg.PROACTIVE_DM_LATE_CHANCE:g}")
+    if updates:
+        await save_persisted_config(updates)
+
+    test_result = ""
+    if 立即发送:
+        hour = datetime.now(ZoneInfo("Asia/Shanghai")).hour
+        ok, detail = await tasks_bg.send_proactive_dm(is_late_night=2 <= hour < 8)
+        test_result = f"\n- 立即发送：{'✅' if ok else '❌'} {detail}"
+
+    expected = tasks_bg.PROACTIVE_DM_CHANCE * (24 / max(1, tasks_bg.PROACTIVE_DM_INTERVAL_HOURS))
+    lines = [
+        "**💌 当前主动私信配置**",
+        f"- 状态：{'✅开启' if tasks_bg.PROACTIVE_DM_ENABLED else '❌关闭'}",
+        f"- 检查间隔：{tasks_bg.PROACTIVE_DM_INTERVAL_HOURS} 小时，发送概率 {tasks_bg.PROACTIVE_DM_CHANCE:g}"
+        f"（平均每天约 {expected:.1f} 条）",
+        f"- 你安静满 {tasks_bg.PROACTIVE_DM_MIN_IDLE_MINUTES} 分钟之后才会考虑",
+        f"- 深夜（北京 2:00–8:00）：{'允许' if tasks_bg.PROACTIVE_DM_LATE_NIGHT else '不允许'}"
+        f"，概率 {tasks_bg.PROACTIVE_DM_LATE_CHANCE:g}",
+        "-# 他睡着的时段本来就不会发；这里关掉只影响他主动找你，你私聊他照常回。",
+    ]
+    if changes:
+        lines.insert(0, "✅ 已更新：" + "；".join(changes) + "\n")
+    await interaction.followup.send("\n".join(lines)[:2000] + test_result, ephemeral=True)
+
+
+# ==== 状态栏设置 ====
+@slash_tree.command(name="presence", description="恋人专属：调整 T.S. 的 Discord 状态栏轮换")
+@app_commands.describe(
+    启用轮换="关掉后状态栏定格在当前这个，不再自动更换（他的作息和提示词不受影响）",
+    检查间隔分钟="后台多久检查一次状态栏（1~120）",
+    瞬时状态="AI 现编的碎碎念气泡；关掉后只用设定里的固定活动，不再为状态栏花额度",
+    瞬时概率="允许瞬时的时段里真正出现的概率（0~1）",
+    瞬时时长分钟="一句碎碎念最多挂多久，之后落回固定活动（1~120）",
+    立刻换一个="立刻重新挑一个状态挂上",
+    清空状态栏="清空状态栏并停止轮换（最省额度）；想恢复就把『启用轮换』设成 True",
+)
+async def slash_presence_config(
+    interaction: discord.Interaction,
+    启用轮换: bool | None = None,
+    检查间隔分钟: int | None = None,
+    瞬时状态: bool | None = None,
+    瞬时概率: float | None = None,
+    瞬时时长分钟: int | None = None,
+    立刻换一个: bool = False,
+    清空状态栏: bool = False,
+):
+    if interaction.user.id != config.PARTNER_USER_ID:
+        await interaction.response.send_message("这个指令只有恋人能用。", ephemeral=True)
+        return
+    if 清空状态栏 and (立刻换一个 or 启用轮换 is True):
+        await interaction.response.send_message("不能同时清空状态栏又让他换一个。", ephemeral=True)
+        return
+    for label, value, low, high in (
+        ("检查间隔分钟", 检查间隔分钟, 1, 120),
+        ("瞬时时长分钟", 瞬时时长分钟, 1, 120),
+    ):
+        if value is not None and not (low <= value <= high):
+            await interaction.response.send_message(f"`{label}` 必须在 {low}~{high} 之间。", ephemeral=True)
+            return
+    if 瞬时概率 is not None and not (0.0 <= 瞬时概率 <= 1.0):
+        await interaction.response.send_message("`瞬时概率` 必须在 0~1 之间。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    updates: dict[str, object] = {}
+    changes: list[str] = []
+    # 重新开轮换之后要立刻补一次 presence：时段没变的话，光等下一轮是等不到的。
+    need_refresh = False
+    if 启用轮换 is not None:
+        presence_mod.ROTATION_ENABLED = bool(启用轮换)
+        updates["PRESENCE_ROTATION_ENABLED"] = presence_mod.ROTATION_ENABLED
+        changes.append(f"轮换 → {'开' if presence_mod.ROTATION_ENABLED else '关（状态栏定格）'}")
+        if presence_mod.ROTATION_ENABLED:
+            need_refresh = True
+            if presence_mod.CLEARED:
+                # 重新开轮换就等于取消清空，否则开了也什么都不显示。
+                presence_mod.CLEARED = False
+                updates["PRESENCE_CLEARED"] = False
+                changes.append("已取消清空")
+    if 检查间隔分钟 is not None:
+        presence_mod.ROTATE_MINUTES = int(检查间隔分钟)
+        updates["PRESENCE_ROTATE_MINUTES"] = presence_mod.ROTATE_MINUTES
+        try:
+            tasks_bg.rotate_presence.change_interval(minutes=presence_mod.ROTATE_MINUTES)
+        except Exception as e:
+            print(f"⚠️ 调整状态栏检查间隔失败: {e}")
+        changes.append(f"检查间隔 → {presence_mod.ROTATE_MINUTES} 分钟")
+    if 瞬时状态 is not None:
+        presence_mod.TRANSIENT_ENABLED = bool(瞬时状态)
+        updates["PRESENCE_TRANSIENT_ENABLED"] = presence_mod.TRANSIENT_ENABLED
+        changes.append(f"瞬时状态 → {'开' if presence_mod.TRANSIENT_ENABLED else '关（不再为状态栏调用 AI）'}")
+    if 瞬时概率 is not None:
+        presence_mod.TRANSIENT_CHANCE = float(瞬时概率)
+        updates["PRESENCE_TRANSIENT_CHANCE"] = presence_mod.TRANSIENT_CHANCE
+        changes.append(f"瞬时概率 → {presence_mod.TRANSIENT_CHANCE:g}")
+    if 瞬时时长分钟 is not None:
+        presence_mod.TRANSIENT_MINUTES = int(瞬时时长分钟)
+        updates["PRESENCE_TRANSIENT_MINUTES"] = presence_mod.TRANSIENT_MINUTES
+        changes.append(f"瞬时时长 → {presence_mod.TRANSIENT_MINUTES} 分钟")
+    if 清空状态栏:
+        presence_mod.CLEARED = True
+        updates["PRESENCE_CLEARED"] = True
+        await presence_mod.clear_presence_bar()
+        changes.append("状态栏已清空并停止轮换")
+    if updates:
+        await save_persisted_config(updates)
+    if 立刻换一个:
+        if presence_mod.CLEARED:
+            changes.append("状态栏当前是清空的，先用『启用轮换:True』恢复")
+        elif not presence_mod.TRANSIENT_ENABLED and not (state.current_life_slot or {}).get("bubble"):
+            need_refresh = True
+            changes.append("这个时段挂的是固定活动，日程没换就还是它")
+        else:
+            need_refresh = True
+            changes.append("已立刻换了一个")
+    if need_refresh and not presence_mod.CLEARED:
+        await refresh_life_state(force_presence=True, force_bubble=立刻换一个)
+
+    slot = state.current_life_slot or {}
+    current = state.current_presence or {}
+    now_text = (current.get("text") or "").strip()
+    if presence_mod.CLEARED:
+        showing = "🫥 已清空（不显示任何状态，也不调用 AI）"
+    elif now_text:
+        kind_cn = {"listening": "正在听", "playing": "正在做", "watching": "正在看",
+                   "custom": "气泡"}.get(current.get("kind") or "", "状态")
+        showing = f"{kind_cn}：{now_text}{'（瞬时）' if slot.get('transient') else '（固定活动）'}"
+    else:
+        showing = "（还没设置过）"
+    lines = [
+        "**🎭 当前状态栏配置**",
+        f"- 正在显示：{showing}",
+        f"- 此刻的日程：{slot.get('label') or '未知'}（{slot.get('start', '')}–{slot.get('end', '')}）",
+        f"- 轮换：{'✅开启' if presence_mod.ROTATION_ENABLED and not presence_mod.CLEARED else '❌停止'}"
+        f"，每 {presence_mod.ROTATE_MINUTES} 分钟检查一次",
+        f"- 瞬时碎碎念：{'✅开启' if presence_mod.TRANSIENT_ENABLED else '❌关闭'}"
+        f"（概率 {presence_mod.TRANSIENT_CHANCE:g}，最多挂 {presence_mod.TRANSIENT_MINUTES} 分钟）",
+        "-# 状态栏跟着他当天的日程走：时段一换就换一个，时段开头还可能挂一句碎碎念，",
+        "-# 挂满上面那个时长就落回这个时段的固定活动。只有碎碎念要花额度。",
+        "-# 停止轮换或清空都只影响 Discord 那一栏，他提示词里「此刻在做什么」照常更新。",
+    ]
+    if changes:
+        lines.insert(0, "✅ 已更新：" + "；".join(changes) + "\n")
+    await interaction.followup.send("\n".join(lines)[:2000], ephemeral=True)
 
 
 # ==== 出差设置 ====

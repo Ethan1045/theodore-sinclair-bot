@@ -22,6 +22,7 @@ from history import (
 from memory import fetch_due_reminders, delete_reminder, get_recall_candidate
 from directives import parse_bot_directives
 from presence import generate_presence, generate_custom_bubble, _TYPE_MAP
+import presence as presence_mod
 from followups import check_due_followups
 from polls import check_ended_polls
 from life_state import refresh_life_state
@@ -55,6 +56,14 @@ _proactive_topic_state: dict = {
     "recent_topics": [],
     "channel_cursor": 0,
 }
+
+# ==== 主动私信（可通过 /proactive_dm 实时修改）====
+PROACTIVE_DM_ENABLED = True          # 总开关，关掉后他完全不会主动私信
+PROACTIVE_DM_INTERVAL_HOURS = 8      # 多久检查一次「要不要找她」
+PROACTIVE_DM_CHANCE = 0.15           # 每次检查真正发出去的概率
+PROACTIVE_DM_MIN_IDLE_MINUTES = 90   # 她安静满多久之后才考虑主动开口
+PROACTIVE_DM_LATE_NIGHT = True       # 深夜（她那边 2~8 点）是否允许
+PROACTIVE_DM_LATE_CHANCE = 0.03      # 深夜时段额外的一层概率
 
 # ==== 每日卡片防重复 ====
 _last_daily_card_date: str = ""
@@ -215,9 +224,11 @@ async def generate_daily_card_data(weather: str | None = None) -> dict | None:
 
 # ==== @tasks.loop 后台任务 ====
 
-@tasks.loop(hours=8)
+@tasks.loop(hours=PROACTIVE_DM_INTERVAL_HOURS)
 async def proactive_dm_partner():
     await discord_client.wait_until_ready()
+    if not PROACTIVE_DM_ENABLED:
+        return
     # 睡眠时段不主动发私信
     is_sleeping, sleep_phase = config.is_sleep_time()
     if state.current_life_slot:
@@ -228,21 +239,24 @@ async def proactive_dm_partner():
     if state.last_partner_activity_at is not None:
         from datetime import timezone
         idle = (datetime.now(timezone.utc) - state.last_partner_activity_at).total_seconds()
-        if idle < 90 * 60:
+        if idle < PROACTIVE_DM_MIN_IDLE_MINUTES * 60:
             return
-    if random.random() > 0.15:
+    if random.random() > PROACTIVE_DM_CHANCE:
         return
 
-    now_bj = datetime.now(ZoneInfo("Asia/Shanghai"))
-    hour = now_bj.hour
-
-    if 2 <= hour < 8:
-        if random.random() > 0.03:
+    hour = datetime.now(ZoneInfo("Asia/Shanghai")).hour
+    is_late_night = 2 <= hour < 8
+    if is_late_night:
+        if not PROACTIVE_DM_LATE_NIGHT:
             return
-        is_late_night = True
-    else:
-        is_late_night = False
+        if random.random() > PROACTIVE_DM_LATE_CHANCE:
+            return
 
+    await send_proactive_dm(is_late_night=is_late_night)
+
+
+async def send_proactive_dm(*, is_late_night: bool = False) -> tuple[bool, str]:
+    """真正把私信发出去。返回 (是否发出, 说明)，/proactive_dm 的『立即发送』也走这里。"""
     try:
         from datetime import timezone
         from ai_client import call_ai
@@ -286,10 +300,10 @@ async def proactive_dm_partner():
         temp_history.append({"role": "user", "content": prompt_content})
         raw_reply = await call_ai(temp_history)
         if "[IGNORE]" in raw_reply.upper():
-            return
+            return False, "他这次选择不说话（[IGNORE]）"
         _, msgs, _, _, _ = parse_bot_directives(raw_reply)
         if not msgs:
-            return
+            return False, "模型没有产出可发送的消息"
         for msg_text in msgs:
             await partner.send(msg_text)
             await asyncio.sleep(1.5)
@@ -301,8 +315,10 @@ async def proactive_dm_partner():
             })
         await trim_history(dm_key)
         print(f"✅ 主动私信恋人发送成功（深夜模式: {is_late_night}）")
+        return True, "已发出"
     except Exception as e:
         print(f"主动私信恋人报错: {e}")
+        return False, str(e)[:150]
 
 
 @tasks.loop(hours=1)
@@ -1006,7 +1022,7 @@ async def _wakeup_catchup():
             print(f"⚠️ 睡醒补回复失败 (频道 {ch_id}): {e}")
 
 
-@tasks.loop(minutes=2)
+@tasks.loop(minutes=presence_mod.ROTATE_MINUTES)
 async def rotate_presence():
     await discord_client.wait_until_ready()
     previous = state.current_life_slot or {}

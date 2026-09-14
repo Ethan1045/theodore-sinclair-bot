@@ -224,6 +224,18 @@ _PERSISTED_CONFIG_KEYS: dict[str, type] = {
     "TRIP_MAX_DAYS": float,
     "TRIP_MIN_GAP_DAYS": float,
     "TRIP_STATE": str,
+    "PROACTIVE_DM_ENABLED": bool,
+    "PROACTIVE_DM_INTERVAL_HOURS": int,
+    "PROACTIVE_DM_CHANCE": float,
+    "PROACTIVE_DM_MIN_IDLE_MINUTES": int,
+    "PROACTIVE_DM_LATE_NIGHT": bool,
+    "PROACTIVE_DM_LATE_CHANCE": float,
+    "PRESENCE_ROTATION_ENABLED": bool,
+    "PRESENCE_ROTATE_MINUTES": int,
+    "PRESENCE_CLEARED": bool,
+    "PRESENCE_TRANSIENT_ENABLED": bool,
+    "PRESENCE_TRANSIENT_CHANCE": float,
+    "PRESENCE_TRANSIENT_MINUTES": int,
 }
 
 
@@ -304,6 +316,24 @@ def _apply_persisted_config(parsed: dict) -> None:
         loaded_state = json.loads(parsed["PROACTIVE_TOPIC_STATE"])
         if isinstance(loaded_state, dict):
             tasks_bg._proactive_topic_state = loaded_state
+    for key in (
+        "PROACTIVE_DM_ENABLED", "PROACTIVE_DM_INTERVAL_HOURS", "PROACTIVE_DM_CHANCE",
+        "PROACTIVE_DM_MIN_IDLE_MINUTES", "PROACTIVE_DM_LATE_NIGHT", "PROACTIVE_DM_LATE_CHANCE",
+    ):
+        if key in parsed:
+            setattr(tasks_bg, key, parsed[key])
+    # 状态栏那几个常量住在 presence 里（life_state 读它，tasks_bg 也读它）。
+    import presence
+    for key, attr in (
+        ("PRESENCE_ROTATION_ENABLED", "ROTATION_ENABLED"),
+        ("PRESENCE_ROTATE_MINUTES", "ROTATE_MINUTES"),
+        ("PRESENCE_CLEARED", "CLEARED"),
+        ("PRESENCE_TRANSIENT_ENABLED", "TRANSIENT_ENABLED"),
+        ("PRESENCE_TRANSIENT_CHANCE", "TRANSIENT_CHANCE"),
+        ("PRESENCE_TRANSIENT_MINUTES", "TRANSIENT_MINUTES"),
+    ):
+        if key in parsed:
+            setattr(presence, attr, parsed[key])
     # 出差的开关、参数和当前行程都存在同一张 bot_config 里，交给 trips 自己解析。
     import trips
     trips.apply_persisted(parsed)
