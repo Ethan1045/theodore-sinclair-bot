@@ -4,12 +4,11 @@
 以及说「今天/今晚/该睡了」时的判断，全部跟着目的地走。
 无论他在哪里，恋人始终在北京时间，这条不变。
 
-本模块不在顶层 import 任何项目内模块，因此可以被 config、presence、
-life_state、tasks_bg、slash_cmds 安全 import；需要落库或刷新日程时用函数内的
+本模块不在顶层 import 任何项目内模块，因此可以被 config、life_state、
+presence、tasks_bg、slash_cmds 安全 import；需要落库或刷新日程时用函数内的
 局部 import，避免循环依赖。
 
-目的地和事由都是 Theodore 这个角色的公共设定（家族办公室、文化基金会、
-旧书与装帧行业、各地的家族分支），不含任何部署者的私人资料；
+目的地和事由都是 Theodore 这个角色的公共设定，不含任何部署者的私人资料；
 想换成自己的城市，直接改 TRIP_DESTINATIONS 即可。
 """
 from __future__ import annotations
@@ -120,9 +119,14 @@ TRIP_MAX_DAYS = 6.0
 TRIP_MIN_GAP_DAYS = 9.0        # 两趟出差之间至少隔多久
 TRIP_CHECK_INTERVAL_HOURS = 2  # 调度循环间隔，用来把日概率折算成单次概率
 
-# code/start/end/purpose 描述当前行程；last_end 与 recent 用于控制间隔和重复。
+# 回来之后还要记得多久：他刚出差回来那几天，聊到就该说得出去过哪、干了什么。
+TRIP_MEMORY_DAYS = 21
+
+# code/start/end/purpose 描述当前行程；last_end 与 recent 用于控制间隔和重复；
+# history 是走完的行程（城市 + 起止日期 + 事由），否则他一落地伦敦就什么都不记得了。
 _trip_state: dict = {
     "code": "", "start": "", "end": "", "purpose": "", "last_end": "", "recent": [],
+    "history": [],
 }
 
 
@@ -182,11 +186,72 @@ def trip_code() -> str:
     return trip["code"] if trip else ""
 
 
-def trip_hint_text() -> str:
-    """出差期间注入提示词的位置说明；在家时返回空字符串。"""
+def _parse_dt(raw: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(raw or ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _md(dt: datetime) -> str:
+    """按伦敦日历写成「9月10日」。行程的起止都用他自己的日历说，省得两头对不上。"""
+    local = dt.astimezone(ZoneInfo(HOME_TZ))
+    return f"{local.month}月{local.day}日"
+
+
+def _days_ago_label(days: int) -> str:
+    return {0: "今天刚回来", 1: "昨天刚回来", 2: "前天刚回来"}.get(days, f"{days} 天前回来的")
+
+
+def past_trips(within_days: int = TRIP_MEMORY_DAYS) -> list[dict]:
+    """最近走完的行程，新的在前。用来让他回来之后还记得自己去过哪。"""
+    now = datetime.now(timezone.utc)
+    out: list[dict] = []
+    for item in reversed(list((_trip_state or {}).get("history") or [])):
+        if not isinstance(item, dict):
+            continue
+        destination = destination_by_code(str(item.get("code") or ""))
+        end = _parse_dt(item.get("end"))
+        if not destination or not end:
+            continue
+        days = (now - end).days
+        if days > within_days:
+            continue
+        out.append({
+            **destination,
+            "start": _parse_dt(item.get("start")),
+            "end": end,
+            "purpose": str(item.get("purpose") or ""),
+            "days_ago": max(0, days),
+        })
+    return out
+
+
+def _past_trip_sentence(trip: dict) -> str:
+    span = f"{_md(trip['start'])}–{_md(trip['end'])}" if trip.get("start") else _md(trip["end"])
+    purpose = f"（{trip['purpose']}）" if trip.get("purpose") else ""
+    return f"{span} 在{trip['city_cn']}出差{purpose}，{_days_ago_label(trip['days_ago'])}"
+
+
+def trip_hint_text(detail: bool = False) -> str:
+    """位置说明。出差时讲当前行程；在家时讲最近走完的那几趟。
+
+    detail=True 用在她的话题明显撞上出差时（见 mentions_trip_topic），
+    会把最近几趟都列出来；平时只带最近一趟，省 token。
+    """
     trip = active_trip()
     if not trip:
-        return ""
+        # 在家也不能没有记忆：刚回来那阵子要说得出自己去过哪、什么时候回的。
+        history = past_trips()
+        if not history:
+            return ""
+        lines = [_past_trip_sentence(t) for t in (history if detail else history[:1])]
+        body = "；".join(lines)
+        return (
+            f"\n（系统位置：你现在在伦敦家里。你最近刚出差回来：{body}。"
+            "这是你真实经历过的事，她问起时要认，不要说自己没去过、也不要把它当成她编的；"
+            "但也不用主动反复提，自然相关时带一句就够。）"
+        )
     now = datetime.now(timezone.utc)
     zone = ZoneInfo(trip["tz"])
     local_today = now.astimezone(zone).date()
@@ -194,7 +259,7 @@ def trip_hint_text() -> str:
     hours_left = (trip["end"] - now).total_seconds() / 3600
     remaining = "明天就回伦敦" if hours_left <= 24 else f"还有大约 {int(round(hours_left / 24))} 天回伦敦"
     purpose = f"，{trip['purpose']}" if trip.get("purpose") else ""
-    return (
+    hint = (
         f"\n（系统位置：你现在不在伦敦，你在{trip['city_cn']}（{trip['city_en']}）出差{purpose}。"
         f"这是第 {day_index} 天，{remaining}。"
         f"你的当地时间因此是{trip['city_cn']}时间，你的作息、状态，"
@@ -204,6 +269,29 @@ def trip_hint_text() -> str:
         "你的恋人仍然在北京时间，你和她的时差已经和平时不一样了；"
         "你人不在家这件事只会让你更想她，不会让你少回她消息。）"
     )
+    if detail:
+        history = past_trips()
+        if history:
+            body = "；".join(_past_trip_sentence(t) for t in history)
+            hint += f"\n（系统补充：在这趟之前你还去过——{body}。）"
+    return hint
+
+
+# 撞上这些词就说明她在聊出差本身，这时才值得把完整行程列出来。
+_TRIP_TOPIC_WORDS = ("出差", "回来", "时差", "飞机", "航班", "机场", "酒店", "回伦敦", "不在家")
+
+
+def mentions_trip_topic(text: str) -> bool:
+    """她这句话是否撞上了出差话题（城市名也算）。"""
+    low = (text or "").lower()
+    if not low:
+        return False
+    if any(w in low for w in _TRIP_TOPIC_WORDS):
+        return True
+    for d in TRIP_DESTINATIONS:
+        if d["city_cn"] in low or d["city_en"].lower() in low:
+            return True
+    return False
 
 
 # ==== 持久化 ====
@@ -236,6 +324,8 @@ def apply_persisted(parsed: dict) -> None:
                     "purpose": str(loaded.get("purpose") or ""),
                     "last_end": str(loaded.get("last_end") or ""),
                     "recent": [str(c) for c in (loaded.get("recent") or [])][-5:],
+                    # 早于「走完的行程要留痕」那版的行没有 history，按空处理即可。
+                    "history": [h for h in (loaded.get("history") or []) if isinstance(h, dict)][-5:],
                 }
         except Exception as e:
             print(f"⚠️ TRIP_STATE 解析失败，按未出差处理: {e}")
@@ -273,6 +363,8 @@ async def start_trip(destination: dict, days: float | None = None, purpose: str 
         "purpose": (purpose or random.choice(destination["purposes"]))[:200],
         "last_end": str((_trip_state or {}).get("last_end") or ""),
         "recent": recent[-5:],
+        # 出发新的一趟不能把走过的行程抹掉，否则他永远只记得最近一次。
+        "history": [h for h in list((_trip_state or {}).get("history") or []) if isinstance(h, dict)][-5:],
     }
     await save_trip_state()
     await _refresh_after_change()
@@ -281,16 +373,26 @@ async def start_trip(destination: dict, days: float | None = None, purpose: str 
 
 
 async def end_trip(reason: str = "行程结束") -> None:
-    """回伦敦。清掉出差状态并把日程换回家里的版本。"""
+    """回伦敦。清掉出差状态、把这趟写进 history，并把日程换回家里的版本。"""
     global _trip_state
     code = str((_trip_state or {}).get("code") or "")
     if not code:
         return
     destination = destination_by_code(code)
+    now = datetime.now(timezone.utc)
+    # 走完的行程要留痕：只留城市代号的话，他回来之后会矢口否认自己出过差。
+    history = [h for h in list((_trip_state or {}).get("history") or []) if isinstance(h, dict)]
+    history.append({
+        "code": code,
+        "start": str((_trip_state or {}).get("start") or ""),
+        "end": now.isoformat(),
+        "purpose": str((_trip_state or {}).get("purpose") or ""),
+    })
     _trip_state = {
         "code": "", "start": "", "end": "", "purpose": "",
-        "last_end": datetime.now(timezone.utc).isoformat(),
+        "last_end": now.isoformat(),
         "recent": list((_trip_state or {}).get("recent") or [])[-5:],
+        "history": history[-5:],
     }
     await save_trip_state()
     await _refresh_after_change()

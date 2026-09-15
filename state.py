@@ -118,17 +118,20 @@ daily_life_trip: str = ""
 current_life_slot: dict | None = None
 
 
-def trip_hint_text() -> str:
-    """他此刻是否在出差。state 不该有硬依赖，所以局部 import，失败就当他在家。"""
+def trip_hint_text(topic: str = "") -> str:
+    """他此刻是否在出差。state 不该有硬依赖，所以局部 import，失败就当他在家。
+
+    topic 是她这句话的原文：撞上出差话题时才把完整行程列出来，平时只带最近一趟。
+    """
     try:
         import trips
-        return trips.trip_hint_text()
+        return trips.trip_hint_text(detail=trips.mentions_trip_topic(topic))
     except Exception:
         return ""
 
 
-def life_hint_text() -> str:
-    trip_hint = trip_hint_text()
+def life_hint_text(topic: str = "") -> str:
+    trip_hint = trip_hint_text(topic)
     slot = current_life_slot or {}
     label = (slot.get("label") or "").strip()
     if not label:
