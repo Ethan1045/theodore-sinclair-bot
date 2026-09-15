@@ -546,7 +546,8 @@ async def on_message(message):
     if sticker_ctx:
         ephemeral_parts.append(sticker_ctx)
 
-    life_ctx = state.life_hint_text()
+    # 把她这句话传进去：聊到出差/城市/时差时才展开完整行程，平时只带最近一趟。
+    life_ctx = state.life_hint_text(user_input)
     if life_ctx:
         ephemeral_parts.append(life_ctx)
 

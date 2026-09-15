@@ -2,7 +2,7 @@
 import os
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # ==== 对话历史常量 ====
@@ -220,10 +220,53 @@ def get_today_occasion() -> str | None:
 
 
 # ==== 时间/表情工具（无 discord 依赖，放这里更轻量）====
+def get_time_context_note() -> str:
+    """两个时钟：他自己的当地时间（出差时跟着目的地走），和恋人的北京时间。
+
+    只给一个时间会出事：出差时提示词里写着「你的当地时间是东京时间」，
+    却从没告诉他东京几点，模型只能拿北京时间硬凑。
+    """
+    now_local = his_now()
+    now_her = datetime.now(ZoneInfo("Asia/Shanghai"))
+    weekdays_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    city_cn, is_trip = "伦敦", False
+    try:
+        import trips
+        location = trips.current_location()
+        city_cn, is_trip = location["city_cn"], location["is_trip"]
+    except Exception:
+        pass
+    tz_label = now_local.tzname() or ""
+    offset_hours = (
+        (now_her.utcoffset() or timedelta()).total_seconds()
+        - (now_local.utcoffset() or timedelta()).total_seconds()
+    ) / 3600
+    if abs(offset_hours) < 0.01:
+        gap_note = "你们此刻没有时差，同一个时间。"
+    elif offset_hours > 0:
+        gap_note = f"她那边比你早 {offset_hours:g} 小时。"
+    else:
+        gap_note = f"她那边比你晚 {abs(offset_hours):g} 小时。"
+    where = (
+        f"你正在{city_cn}出差，所以你的当地时间是{city_cn}时间，不是伦敦时间"
+        if is_trip else "你本人生活在伦敦"
+    )
+    return (
+        f"（系统时间：{where}。以下两个时间分工明确，绝对不要互相混用：\n"
+        f"① 你的当地时间（{city_cn}）：{now_local.strftime('%Y-%m-%d')} "
+        f"{weekdays_cn[now_local.weekday()]} {now_local.strftime('%H:%M')} {tz_label}。"
+        "你自己在做什么、几点了、今天还是明天、你该不该睡、你的日程与状态栏，全部以它为准。\n"
+        f"② 恋人的时间（北京时间，UTC+8）：{now_her.strftime('%Y-%m-%d')} "
+        f"{weekdays_cn[now_her.weekday()]} {now_her.strftime('%H:%M')}。"
+        "判断她那边是早上还是深夜、她是不是该吃饭该睡了、问她今天过得怎么样、"
+        "说早安晚安，一律以它为准。\n"
+        f"{gap_note}）"
+    )
+
+
 def get_beijing_time_note() -> str:
-    now = datetime.now(ZoneInfo("Asia/Shanghai"))
-    weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()]
-    return f"（系统时间：北京时间现在是 {now.strftime('%Y-%m-%d')} {weekday_cn} {now.strftime('%H:%M')}。）"
+    """旧调用兼容层；返回内容已改为「他的当地时间 + 恋人的北京时间」双时区上下文。"""
+    return get_time_context_note()
 
 
 def get_presence_time_context() -> str:

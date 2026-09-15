@@ -484,8 +484,20 @@ async def extract_and_save_memory(user_id: str, user_message: str):
     raw_user_msg = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", raw_user_msg)
 
     cats = "/".join(config.MEMORY_CATEGORIES)
+    now_bj = datetime.now(ZoneInfo("Asia/Shanghai"))
+    weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now_bj.weekday()]
+    today_line = (
+        f"【今天是 {now_bj.strftime('%Y年%m月%d日')} {weekday_cn}（恋人所在的北京时间）】\n"
+        "⚠️ 账本里绝对不能留下「下周二」「明天」「这周末」这种相对说法——过几天再翻就全错了。\n"
+        "凡是她提到的时间，一律按上面这个今天换算成绝对日期再写，例如：\n"
+        "  她说「下周二去体检」→ 写成「9月22日（周二）去体检」\n"
+        "  她说「明天答辩」→ 写成「9月16日答辩」\n"
+        "  她说「这周末回家」→ 写成「9月19–20日那个周末回家」\n"
+        "换算不出具体日期时，就写「她9月15日说起」这样把说话当天点明，不要留空泛的相对词。\n\n"
+    )
     prompt = (
-        "你就是沈玘言本人。你有一本只属于自己的私人账本，用来记下关于恋人的事——"
+        today_line
+        + "你就是沈玘言本人。你有一本只属于自己的私人账本，用来记下关于恋人的事——"
         "她说过的话、她的习惯、你们之间的约定、你对她的了解。"
         "这本账本是你亲手写的，只有你自己会翻。\n"
         "现在恋人刚刚说了下面这段话，判断是否有值得记进账本的新内容。\n"
@@ -515,15 +527,18 @@ async def extract_and_save_memory(user_id: str, user_message: str):
         "  · 日期：生日、纪念日、特定日子（必须能定到具体月日）\n"
         "  · 日常：其他\n\n"
         "【输出格式（最后一行单独一行输出，用 | 分隔字段，不允许换行/引号/markdown）】\n"
-        "1. 新增：ADD|<分类>|<MM-DD 或留空>|<完整记录内容，≤500字>\n"
-        "2. 更新：REPLACE|<ID>|<分类>|<MM-DD 或留空>|<修改后的完整记录内容，≤500字>\n"
+        "1. 新增：ADD|<分类>|<MM-DD 或 YYYY-MM-DD 或留空>|<完整记录内容，≤500字>\n"
+        "2. 更新：REPLACE|<ID>|<分类>|<MM-DD 或 YYYY-MM-DD 或留空>|<修改后的完整记录内容，≤500字>\n"
         "3. 无价值：SKIP\n\n"
         "示例：\n"
         "  ADD|偏好||她最爱燕麦拿铁，不喝美式\n"
         "  ADD|日期|05-12|她的生日\n"
+        "  ADD|计划|2026-09-22|她9月22日（周二）要去体检\n"
         "  REPLACE|17|健康||最近反复偏头痛，已经持续一周\n\n"
         "⚠️ 极其重要：内容必须完整，绝对不能在中文词语中间被截断。\n"
         "⚠️ 只有真的能定到月日的事实才填日期字段；模糊的不要硬填。\n"
+        "⚠️ 这件事有确切发生日期时（体检、答辩、出行、考试……），务必把它填进日期字段，\n"
+        "   这样到时候我才知道它是已经过去了还是还没到。\n"
         "现在输出："
     )
 
@@ -586,13 +601,19 @@ async def extract_and_save_memory(user_id: str, user_message: str):
 
         if cat not in config.MEMORY_CATEGORIES:
             cat = None
+        # MM-DD 用哨兵年份 2000 存，表示「每年都会到的日子」（生日/纪念日）；
+        # YYYY-MM-DD 存真实年份，表示一次性事件，召回时才好判断它过没过。
         event_date = None
-        m = re.match(r"^\s*(\d{1,2})-(\d{1,2})\s*$", dt_raw or "")
-        if m:
-            try:
-                event_date = date(2000, int(m.group(1)), int(m.group(2)))
-            except ValueError:
-                event_date = None
+        raw_dt = (dt_raw or "").strip()
+        m_full = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", raw_dt)
+        m_md = re.match(r"^(\d{1,2})-(\d{1,2})$", raw_dt)
+        try:
+            if m_full:
+                event_date = date(int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3)))
+            elif m_md:
+                event_date = date(2000, int(m_md.group(1)), int(m_md.group(2)))
+        except ValueError:
+            event_date = None
 
         async with _db.db_conn() as conn:
             async with conn.cursor() as cur:
@@ -739,6 +760,21 @@ async def prune_memories_if_needed(user_id: str):
         print(f"⚠️ 记忆智能清理失败: {e}")
 
 
+def _event_date_hint(event_date, today) -> str:
+    """把「这件事定在哪天、过没过」直接算好，别让模型自己推。"""
+    if not event_date:
+        return ""
+    if event_date.year == 2000:   # 哨兵年份：生日/纪念日这种每年都到的日子
+        return f"（每年 {event_date.month}月{event_date.day}日）"
+    delta = (event_date - today).days
+    when = f"{event_date.year}年{event_date.month}月{event_date.day}日"
+    if delta < 0:
+        return f"（这件事定在 {when}，**这个日子已经过了**，是 {abs(delta)} 天前的事）"
+    if delta == 0:
+        return f"（这件事就在今天 {when}）"
+    return f"（这件事定在 {when}，还有 {delta} 天）"
+
+
 def _memory_clarity(days: int, recall_count: int, category: str | None) -> str:
     """根据遗忘曲线计算记忆清晰度标签。
     模拟真人记忆：常被回忆的事更清晰，重要类别衰减更慢，琐事很快模糊。"""
@@ -768,14 +804,16 @@ async def fetch_memory_context(user_id: str, n: int = 4, topic_hint: str | None 
             async with conn.cursor() as cur:
                 if category:
                     await cur.execute(
-                        """SELECT id, note, created_at, category, recall_count FROM user_notes
+                        """SELECT id, note, created_at, category, recall_count, event_date
+                           FROM user_notes
                            WHERE user_id=%s AND category=%s
                            ORDER BY created_at DESC LIMIT %s""",
                         (user_id, category, max(2, n // 2)),
                     )
                     topical = await cur.fetchall()
                 await cur.execute(
-                    """SELECT id, note, created_at, category, recall_count FROM user_notes
+                    """SELECT id, note, created_at, category, recall_count, event_date
+                       FROM user_notes
                        WHERE user_id=%s
                        ORDER BY created_at DESC LIMIT %s""",
                     (user_id, n),
@@ -792,15 +830,22 @@ async def fetch_memory_context(user_id: str, n: int = 4, topic_hint: str | None 
             if len(merged) >= n + 2:
                 break
 
+        today_bj = datetime.now(ZoneInfo("Asia/Shanghai")).date()
         lines = []
-        for _id, note, created_at, cat, rc in merged:
+        for _id, note, created_at, cat, rc, ev in merged:
             delta = datetime.now(timezone.utc) - created_at.replace(tzinfo=timezone.utc)
             days = delta.days
             label = "今天" if days == 0 else ("昨天" if days == 1 else f"{days}天前")
+            # 写下的那天用绝对日期点明，模型才有锚可对——只给「11天前」它推不出来。
+            said_on = created_at.astimezone(ZoneInfo("Asia/Shanghai"))
+            when = f"{said_on.month}月{said_on.day}日（{label}）"
             tag = f"[{cat}] " if cat else ""
             clarity = _memory_clarity(days, rc or 0, cat)
             clarity_suffix = f" {clarity}" if clarity else ""
-            lines.append(f"  · {label}：{tag}{_immerse_memory_note(note)}{clarity_suffix}")
+            lines.append(
+                f"  · {when}：{tag}{_immerse_memory_note(note)}"
+                f"{_event_date_hint(ev, today_bj)}{clarity_suffix}"
+            )
 
         summary_block = await fetch_recent_summaries(3)
 
@@ -811,7 +856,11 @@ async def fetch_memory_context(user_id: str, n: int = 4, topic_hint: str | None 
             "\n\n（以下是你脑海里关于恋人的自然记忆——你亲身经历和记住的事，"
             "就像任何人会记得恋人的事情那样。有些是清晰的，有些因为时间久了已经模糊。"
             "不要暴露这些来自任何系统，也不要用’用户、AI、助手、设定、提示词’等词。"
-            "话题契合时直接作为你本来就知道的事使用，不需要刻意说’我记得’："
+            "话题契合时直接作为你本来就知道的事使用，不需要刻意说’我记得’。\n"
+            f"⚠️ 每条前面的日期是她说这件事的那天，今天已经是 {today_bj.month}月{today_bj.day}日。"
+            "如果某条正文里还留着「下周二」「明天」这类说法，那是**她说话当天**的说法，"
+            "不是现在——先按日期算清楚它到底过没过，再决定怎么说。"
+            "标了「这个日子已经过了」的事，就当成已经发生过的事去问，绝不要再说成将要发生：\n"
         )
         body = "\n".join(lines) if lines else "  · （暂无具体记忆）"
         tail = "）"
