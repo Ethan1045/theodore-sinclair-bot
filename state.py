@@ -36,6 +36,11 @@ def set_current_presence(kind: str, text: str, *, source: str = "auto", duration
     last_presence_change_at = current_presence["since"]
 
 
+# 状态栏提示只在"刚换过"的时候注入。挂了两三个小时的活动本来就没什么可说的，
+# 每条消息都塞一遍纯属浪费 token；真正值得顺口带一句的是刚刚换上去的那个。
+PRESENCE_HINT_FRESH_MINUTES = 20
+
+
 def presence_hint_text() -> str:
     if not current_presence:
         return ""
@@ -47,6 +52,8 @@ def presence_hint_text() -> str:
     mins = 0
     if isinstance(since, datetime):
         mins = max(0, int((datetime.now(timezone.utc) - since).total_seconds() // 60))
+        if mins >= PRESENCE_HINT_FRESH_MINUTES:
+            return ""
     label_map = {
         "listening": "正在听",
         "playing":   "正在做",
