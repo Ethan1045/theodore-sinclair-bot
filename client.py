@@ -12,6 +12,8 @@ intents.members = True
 intents.guilds = True
 intents.reactions = True
 intents.presences = True
+intents.typing = True
+intents.polls = True
 
 discord_client = discord.Client(intents=intents)
 slash_tree = app_commands.CommandTree(discord_client)

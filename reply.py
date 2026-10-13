@@ -1,5 +1,6 @@
 """send_ai_reply 与 _keep_typing：处理 AI 输出并发送到 Discord。"""
 import asyncio
+import json
 import random
 from datetime import datetime, timezone
 
@@ -7,9 +8,10 @@ import discord
 
 import config
 import state
-from history import get_history, trim_history, history_key_for
+from history import get_history, trim_history, history_key_for, record_conversation_event
 from directives import parse_bot_directives
 from actions import execute_action, classify_discord_error
+from relationship_emotion import strip_relationship_directive
 
 
 async def _keep_typing(channel: discord.abc.Messageable, stop: asyncio.Event):
@@ -23,6 +25,8 @@ async def _keep_typing(channel: discord.abc.Messageable, stop: asyncio.Event):
 
 
 async def send_ai_reply(raw_bot_reply: str, trigger_message: discord.Message, channel: discord.abc.Messageable, as_reply=True):
+    # 关系状态块是内部协议；即使某个调用点忘了预处理，也绝不能发给用户。
+    raw_bot_reply = strip_relationship_directive(raw_bot_reply)
     hist_key = history_key_for(channel=channel, message=trigger_message)
     bucket_lock = state.get_bucket_lock(hist_key)
     hist = get_history(hist_key)
@@ -41,6 +45,11 @@ async def send_ai_reply(raw_bot_reply: str, trigger_message: discord.Message, ch
             hist.append({"role": "assistant", "content": history_text})
         else:
             hist.append({"role": "assistant", "content": "（只挂了表情，没说话）"})
+    if history_text:
+        state.spawn_bg(
+            record_conversation_event(hist_key, "assistant", history_text),
+            name=f"daily-event:assistant:{getattr(trigger_message, 'id', 'unknown')}",
+        )
     await trim_history(hist_key)
 
     long_pause = (len(messages_to_send) == 2 and random.random() < 0.10)
@@ -50,7 +59,18 @@ async def send_ai_reply(raw_bot_reply: str, trigger_message: discord.Message, ch
             async with channel.typing():
                 await asyncio.sleep(min(0.5 + len(msg_text) * 0.01, 2.0))
             if as_reply and hasattr(trigger_message, 'reply'):
-                sent_message = await trigger_message.reply(msg_text)
+                try:
+                    sent_message = await trigger_message.reply(
+                        msg_text,
+                        mention_author=False,
+                        fail_if_not_exists=False,
+                    )
+                except (discord.Forbidden, discord.NotFound, discord.HTTPException, TypeError, ValueError) as exc:
+                    print(
+                        "⚠️ 引用回复失败，改为普通发送 "
+                        f"({classify_discord_error(exc)}): trigger_msg={getattr(trigger_message, 'id', None)}"
+                    )
+                    sent_message = await channel.send(msg_text)
             else:
                 sent_message = await channel.send(msg_text)
         else:
@@ -64,18 +84,35 @@ async def send_ai_reply(raw_bot_reply: str, trigger_message: discord.Message, ch
             sent_message = await channel.send(msg_text)
 
     if emojis_to_react:
-        if reaction_target == "USER" or not sent_message:
-            target_msg = trigger_message
-        else:
+        if reaction_target == "SELF" and sent_message:
             target_msg = sent_message
+        else:
+            target_msg = trigger_message
         for emoji in emojis_to_react:
             try:
                 await target_msg.add_reaction(emoji)
             except Exception as e:
                 print(f"挂表情失败 ({classify_discord_error(e)}): emoji={emoji} target_msg={getattr(target_msg,'id',None)}")
 
+    action_notices: list[str] = []
     for action_str in action_matches:
-        await execute_action(action_str, trigger_message)
+        try:
+            action_type = str(json.loads(action_str).get("type", "")).upper()
+        except Exception:
+            action_type = ""
+        if action_type == "EDIT_OWN_MESSAGE":
+            # Editing deliberately happens seconds later without holding up the event handler.
+            state.spawn_bg(
+                execute_action(action_str, trigger_message, response_message=sent_message),
+                name=f"refine:{getattr(sent_message, 'id', 'none')}",
+            )
+        else:
+            result = await execute_action(action_str, trigger_message, response_message=sent_message)
+            if isinstance(result, str) and result.strip():
+                action_notices.append(result.strip())
+
+    if action_notices:
+        await channel.send("\n".join(action_notices)[:2000])
 
     if history_text:
         _eat_kws = ["吃了吗", "吃饭了吗", "吃了没", "have you eaten", "eaten yet", "吃东西", "记得吃"]

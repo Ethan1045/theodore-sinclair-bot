@@ -2,7 +2,8 @@
 import asyncio
 import json as _json
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import discord
 
@@ -170,7 +171,10 @@ def _serialize_history(hist: list[dict]) -> list[dict]:
             content = text
         if not isinstance(content, str):
             content = str(content or "")
-        out.append({"role": role, "content": content})
+        saved = {"role": role, "content": content}
+        if msg.get("source"):
+            saved["source"] = str(msg["source"])
+        out.append(saved)
     return out[-config.MAX_HISTORY:]
 
 
@@ -179,7 +183,10 @@ def _deserialize_history(saved: list) -> list[dict]:
     if isinstance(saved, list):
         for msg in saved:
             if isinstance(msg, dict) and msg.get("role") and msg.get("content") is not None:
-                hist.append({"role": msg["role"], "content": msg["content"]})
+                restored = {"role": msg["role"], "content": msg["content"]}
+                if msg.get("source"):
+                    restored["source"] = str(msg["source"])
+                hist.append(restored)
     return hist
 
 
@@ -256,6 +263,10 @@ async def load_all_histories():
             hist = _deserialize_history(saved)
             if len(hist) <= 1:
                 continue
+            # 旧版主动私信与睡醒补回只写 assistant、不写 user，久而久之会把
+            # DM 桶灌成一串 Morning。这样的单边记录不是对话，不恢复进模型上下文。
+            if not any(msg.get("role") == "user" for msg in hist[1:]):
+                continue
             state._histories[bucket_key] = hist
             if updated_at is not None:
                 state._bucket_touched[bucket_key] = updated_at
@@ -264,3 +275,110 @@ async def load_all_histories():
             print(f"⚠️ 恢复桶 {bucket_key} 失败：{e}")
     if restored:
         print(f"✅ 已从数据库恢复 {restored} 个对话桶")
+
+
+async def remember_outbound_context(key: str, content: str, *, source: str) -> None:
+    """保留最近一条主动消息，供恋人接话；不让单边自动消息无限堆满桶。"""
+    text = str(content or "").strip()
+    if not text:
+        return
+    lock = state.get_bucket_lock(key)
+    async with lock:
+        hist = get_history(key)
+        while len(hist) > 1 and hist[-1].get("source") == source:
+            hist.pop()
+        if not any(msg.get("role") == "user" for msg in hist[1:]):
+            hist[1:] = []
+        hist.append({"role": "assistant", "content": text, "source": source})
+        state.mark_history_dirty(key)
+    await trim_history(key)
+
+
+async def ensure_conversation_events_table() -> None:
+    """按时间保存真实聊天轮次，供每日摘要准确读取“昨天”的内容。"""
+    if not config.DATABASE_URL:
+        return
+    try:
+        async with _db.db_conn() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("""
+                    CREATE TABLE IF NOT EXISTS theodore_conversation_events (
+                        id BIGSERIAL PRIMARY KEY,
+                        bucket_key TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        source TEXT NOT NULL DEFAULT 'chat',
+                        occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+                await cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_theodore_conversation_events_time
+                    ON theodore_conversation_events (occurred_at)
+                """)
+                await conn.commit()
+        print("✅ theodore_conversation_events 表已就绪")
+    except Exception as exc:
+        print(f"⚠️ theodore_conversation_events 表初始化失败: {exc}")
+
+
+async def record_conversation_event(
+    bucket_key: str,
+    role: str,
+    content: str,
+    *,
+    source: str = "chat",
+) -> None:
+    if not config.DATABASE_URL or role not in {"user", "assistant"}:
+        return
+    clean = re.sub(r"\s+", " ", str(content or "")).strip()[:4000]
+    if not clean:
+        return
+    try:
+        async with _db.db_conn() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """INSERT INTO theodore_conversation_events
+                           (bucket_key, role, content, source)
+                       VALUES (%s, %s, %s, %s)""",
+                    (bucket_key, role, clean, source),
+                )
+                await conn.commit()
+    except Exception as exc:
+        print(f"⚠️ 记录每日摘要素材失败: {exc}")
+
+
+async def fetch_conversation_events_for_day(target_date: date) -> list[tuple[str, str, str]]:
+    if not config.DATABASE_URL:
+        return []
+    beijing = ZoneInfo("Asia/Shanghai")
+    start = datetime.combine(target_date, time.min, tzinfo=beijing).astimezone(timezone.utc)
+    end = (datetime.combine(target_date, time.min, tzinfo=beijing) + timedelta(days=1)).astimezone(timezone.utc)
+    try:
+        async with _db.db_conn() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """SELECT role, content, bucket_key
+                       FROM theodore_conversation_events
+                       WHERE occurred_at >= %s AND occurred_at < %s AND source='chat'
+                       ORDER BY occurred_at ASC, id ASC""",
+                    (start, end),
+                )
+                return await cur.fetchall()
+    except Exception as exc:
+        print(f"⚠️ 读取每日摘要素材失败: {exc}")
+        return []
+
+
+async def prune_conversation_events(*, keep_days: int = 45) -> None:
+    if not config.DATABASE_URL:
+        return
+    try:
+        async with _db.db_conn() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM theodore_conversation_events WHERE occurred_at < NOW() - (%s * INTERVAL '1 day')",
+                    (max(7, keep_days),),
+                )
+                await conn.commit()
+    except Exception as exc:
+        print(f"⚠️ 清理每日摘要素材失败: {exc}")

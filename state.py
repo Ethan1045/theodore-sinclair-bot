@@ -36,6 +36,11 @@ def set_current_presence(kind: str, text: str, *, source: str = "auto", duration
     last_presence_change_at = current_presence["since"]
 
 
+# 状态栏提示只在"刚换过"的时候注入。挂了两三个小时的活动本来就没什么可说的，
+# 每条消息都塞一遍纯属浪费 token；真正值得顺口带一句的是刚刚换上去的那个。
+PRESENCE_HINT_FRESH_MINUTES = 20
+
+
 def presence_hint_text() -> str:
     if not current_presence:
         return ""
@@ -47,6 +52,8 @@ def presence_hint_text() -> str:
     mins = 0
     if isinstance(since, datetime):
         mins = max(0, int((datetime.now(timezone.utc) - since).total_seconds() // 60))
+        if mins >= PRESENCE_HINT_FRESH_MINUTES:
+            return ""
     label_map = {
         "listening": "正在听",
         "playing":   "正在做",
@@ -73,6 +80,9 @@ care_reminder_last: dict[str, datetime] = {}
 # ==== 恋人 上线感知 ====
 partner_last_seen_online: datetime | None = None
 
+# ==== 睡眠期间待回复消息 ====
+sleep_pending_messages: list[dict] = []
+
 # ==== 节日发言防重复 ====
 _last_occasion_date: str = ""
 
@@ -98,6 +108,51 @@ _bg_lock: "asyncio.Lock | None" = None
 
 # ==== 消息合并窗口状态 ====
 _merge_state: dict[tuple, dict] = {}
+
+# ==== 用户正在输入（用于消息合并窗口）====
+user_typing_at: dict[tuple[int, int], float] = {}
+
+# ==== 持久化每日生活状态机 ====
+daily_life_date = None
+daily_life_schedule: list[dict] = []
+# 生成当前这份日程时他所在的行程代号（""＝在伦敦）。出发/返程时用来判定旧日程作废。
+daily_life_trip: str = ""
+current_life_slot: dict | None = None
+
+
+def _trip_hint_text(topic: str = "") -> str:
+    """出差提示。state 不该有硬依赖，所以局部 import，失败就当他在家。
+
+    topic 是她这句话的原文：撞上出差话题时才把完整行程列出来，平时只带最近一趟。
+    """
+    try:
+        import trips
+        return trips.trip_hint_text(detail=trips.mentions_trip_topic(topic))
+    except Exception:
+        return ""
+
+
+def life_hint_text(topic: str = "") -> str:
+    trip_hint = _trip_hint_text(topic)
+    slot = current_life_slot or {}
+    label = (slot.get("label") or "").strip()
+    if not label:
+        return trip_hint
+    availability = slot.get("availability", "available")
+    availability_cn = {
+        "limited": "当前活动不妨碍你认真回复，可以正常聊天",
+        "asleep": "正在睡觉",
+        "available": "目前可以正常聊天",
+    }.get(availability, "目前可以正常聊天")
+    proactive = (slot.get("proactive") or "").strip()
+    proactive_hint = f"若你主动开口，可以自然从「{proactive}」生发，但不要硬提。" if proactive else ""
+    city = (slot.get("city") or "伦敦").strip()
+    where = f"{city}日程" if slot.get("is_trip") else "伦敦日程"
+    return trip_hint + (
+        f"\n（系统背景：按照你今天已经确定的{where}，你此刻{label}，{availability_cn}。"
+        f"当前位置、正在做的事、主动消息和状态栏必须与这件事一致；不要编造互相冲突的活动。"
+        f"回复长度和消息条数只由谈话内容决定，不因工作、通勤、训练或其他日程活动而缩短。{proactive_hint}）"
+    )
 
 # ==== 后台任务追踪 ====
 _bg_tasks: set[asyncio.Task] = set()

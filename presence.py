@@ -2,6 +2,7 @@
 import asyncio
 import random
 import re
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -49,6 +50,28 @@ _VERB_TO_KIND = {
 }
 
 
+# ==== 状态栏轮换节奏（由 /状态栏设置 实时调整并落库，不用改代码）====
+# 锚定活动 = 他设定里真实会做的事，可以稳定挂一段时间，不花额度。
+# 瞬时气泡 = AI 现编的一句碎碎念；只在一个时段的开头挂一会儿就落回锚定活动，
+# 挂久了会变成「盯了四十分钟鸽子」。关掉 TRANSIENT_ENABLED 就完全不为状态栏调用 AI。
+ROTATION_ENABLED = True    # 关掉后状态栏定格在当前这个，不再自动更换
+ROTATE_MINUTES = 2         # 后台多久检查一次状态栏
+CLEARED = False            # 清空状态栏：什么都不显示，且完全不调用 AI
+TRANSIENT_ENABLED = True   # 瞬时气泡总开关
+TRANSIENT_CHANCE = 0.3     # 一个允许瞬时的时段里真正出现的概率
+TRANSIENT_MINUTES = 18     # 一句碎碎念最多挂多久，之后落回锚定活动
+
+
+async def clear_presence_bar() -> None:
+    """把 Discord 状态栏清空（什么都不显示）。停掉轮换时用，省额度也靠它。"""
+    try:
+        await discord_client.change_presence(status=discord.Status.idle, activity=None)
+        state.set_current_presence("", "", source="cleared")
+        print("🫥 状态栏已清空")
+    except Exception as exc:
+        print(f"⚠️ 清空状态栏失败: {exc}")
+
+
 def _presence_cooldown_ok() -> bool:
     if state.last_presence_change_at is None:
         return True
@@ -74,6 +97,10 @@ async def apply_presence(kind: str, text: str, *, source: str) -> bool:
 
 
 async def try_explicit_activity_sync(text: str) -> None:
+    # The persistent day plan is the source of truth; ad-hoc keyword changes
+    # would make the avatar disagree with reply/proactive context.
+    if state.current_life_slot:
+        return
     if not text or not _presence_cooldown_ok():
         return
     m = _EXPLICIT_ACTIVITY_RE.search(text)
@@ -89,6 +116,8 @@ async def try_explicit_activity_sync(text: str) -> None:
 
 
 async def try_keyword_presence_update(text: str) -> None:
+    if state.current_life_slot:
+        return
     if random.random() > 0.35:
         return
     if not _presence_cooldown_ok():
@@ -100,15 +129,32 @@ async def try_keyword_presence_update(text: str) -> None:
             return
 
 
+def _where_is_he() -> tuple[str, str]:
+    """(城市英文名, 给提示词用的一句位置说明)。出差时状态栏也要跟着那座城市走。"""
+    import trips
+    location = trips.current_location()
+    if not location["is_trip"]:
+        return location["city_en"], "He is at home in London."
+    return location["city_en"], (
+        f"He is NOT in London right now — he is on a business trip in {location['city_en']}. "
+        f"Base the status on {location['city_en']} local time and surroundings (hotel, meetings, jet lag), "
+        "without turning it into travel bragging."
+    )
+
+
 async def generate_presence() -> tuple[str, discord.ActivityType, str]:
     from config import get_presence_time_context
     time_ctx = get_presence_time_context()
+    city_en, where_hint = _where_is_he()
     prompt = (
         f"{time_ctx}\n"
-        "Generate a Discord status for T.S. (Theodore Sinclair / 沈玘言), a 32-year-old Anglo-Chinese man living in London.\n"
+        "Generate a Discord status for T.S. (Theodore Sinclair / 沈玘言), a 32-year-old Anglo-Chinese man based in London.\n"
+        f"{where_hint}\n"
         "The status appears next to his avatar as 'Listening to xxx' / 'Playing xxx' / 'Watching xxx'.\n\n"
         "【Rules】\n"
-        "1. Base the activity on HIS London local time — what would he plausibly be doing right now?\n"
+        f"1. Base the activity on HIS local time in {city_en} — what would he plausibly be doing right now?\n"
+        "1a. His temperament is consistently gentle, composed, restrained, highly capable and well-mannered. The status must fit his established life: family-office work, foundation governance, archival/book conservation, serious reading, fencing, swimming, riding, tea, restrained music listening or quiet travel.\n"
+        "1b. Do not invent quirky habits, comic incompetence, flippant thoughts, internet slang, attention-seeking moods, melodrama or random contrast for 'human realism'. Never make him look unserious or out of character.\n"
         "2. listening → a real song / album / artist\n"
         "3. playing → a specific thing he's doing\n"
         "4. watching → something he's observing or paying attention to\n"
@@ -152,10 +198,10 @@ async def generate_presence() -> tuple[str, discord.ActivityType, str]:
 
         if text in state._recent_presences:
             fallback_texts = [
-                "Restoring a 19th c. spine", "Quietly bullying spreadsheets",
+                "Restoring a 19th c. spine", "Reviewing family-office papers",
                 "Window light on old paper", "Late letters to Geneva",
-                "Listening for your typing", "Re-shelving first editions",
-                "Adjusting cufflinks again", "Watching London fog collect",
+                "Chet Baker in the study", "Re-shelving first editions",
+                "Foundation papers", "Watching London fog collect",
             ]
             unused = [t for t in fallback_texts if t not in state._recent_presences]
             text = random.choice(unused or fallback_texts)
@@ -193,10 +239,12 @@ async def generate_custom_bubble() -> str:
     time_ctx = get_presence_time_context()
     recent_str = ", ".join(state._recent_presences[-5:]) if state._recent_presences else "none"
 
+    city_en, where_hint = _where_is_he()
     prompt = (
         f"{time_ctx}\n"
         "Generate a Discord custom status bubble for T.S. (Theodore Sinclair / 沈玘言), "
-        "a 32-year-old Anglo-Chinese man living in London.\n"
+        "a 32-year-old Anglo-Chinese man based in London.\n"
+        f"{where_hint}\n"
         "This text appears in a bubble next to his avatar, like a real person's casual status update.\n\n"
         "【Direction (pick one randomly)】\n"
         "- A random thought in his head (very short, like talking to himself)\n"
@@ -204,7 +252,7 @@ async def generate_custom_bubble() -> str:
         "- A small thing he's doing right now\n"
         "- A cryptic one-liner that fits his vibe\n\n"
         "【Language】Mostly English (70-80%), occasionally Chinese or mixed. He's half-British half-Chinese.\n"
-        "【Time】Base it on his London local time, not Beijing time.\n"
+        f"【Time】Base it on his local time in {city_en}, not Beijing time.\n"
         "【Forbidden】Motivational quotes, saccharine tone, marketing-speak\n"
         "- Don't repeat recent statuses: " + recent_str + "\n\n"
         "【Format】Max 40 characters, shorter is better, output exactly one line.\n\n"
@@ -250,9 +298,13 @@ async def generate_custom_bubble() -> str:
         return text
 
 
-async def get_london_weather() -> str | None:
+async def get_city_weather(city_en: str = "London") -> str | None:
+    """查某座城市的实时天气。出差时传目的地，在家时就是伦敦。"""
+    city = (city_en or "London").strip() or "London"
+    query = urllib.parse.quote(city.replace(" ", "+"), safe="+")
+
     def _fetch():
-        url = "https://wttr.in/London?format=%C+%t&lang=en"
+        url = f"https://wttr.in/{query}?format=%C+%t&lang=en"
         req = urllib.request.Request(url, headers={"User-Agent": "curl/7.0"})
         with urllib.request.urlopen(req, timeout=5) as r:
             return r.read().decode().strip()
@@ -260,6 +312,12 @@ async def get_london_weather() -> str | None:
         return await asyncio.to_thread(_fetch)
     except Exception:
         return None
+
+
+async def get_london_weather() -> str | None:
+    """兼容旧调用：他此刻所在地的天气（在家就是伦敦）。"""
+    import trips
+    return await get_city_weather(trips.current_location()["city_en"])
 
 
 def get_guild_emoji_hint(guild: "discord.Guild | None") -> str:
@@ -276,5 +334,20 @@ def get_guild_emoji_hint(guild: "discord.Guild | None") -> str:
     return (
         "\n\n【本服务器的自定义表情】你可以在聊天文本里直接使用下列自定义表情（复制粘贴整个尖括号标签即可），"
         "它们会在Discord里正确渲染成表情图片。不要滥用，只在真正合适时用一个。\n"
+        + "\n".join(lines)
+    )
+
+
+def get_guild_sticker_hint(guild: "discord.Guild | None") -> str:
+    """Expose only stickers the bot can actually send in the current guild."""
+    if not guild:
+        return ""
+    stickers = [s for s in guild.stickers if getattr(s, "available", True)]
+    if not stickers:
+        return ""
+    lines = [f"- {s.name}（sticker_id={s.id}）" for s in stickers[:20]]
+    return (
+        "\n\n【本服务器贴纸】极少数时候，你可以不发正文、只用一个服务器贴纸回应。"
+        "仅可从下列清单选择，并输出 SEND_STICKER 动作；不要臆造ID，也不要与文字表情同时滥用。\n"
         + "\n".join(lines)
     )

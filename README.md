@@ -80,20 +80,24 @@ cd <你的私库>
   "DAILY_TOKEN_BUDGET": 200000,
 
   "PARTNER_USER_ID": 12345678901234567,
+  "PARTNER_FRIEND_IDS": [],
   "PARTNER_HOME_CHANNEL_ID": 0,
   "PROACTIVE_CHANNEL_ID": 0,
 
   "QUIET_CHANNEL_IDS": [],
-  "SILENT_CHANNEL_IDS": []
+  "SILENT_CHANNEL_IDS": [],
+  "MUTATING_CHANNEL_IDS": []
 }
 ```
 
 字段说明：
 - `PARTNER_USER_ID`（**必填**）：你的 Discord 用户 ID。
+- `PARTNER_FRIEND_IDS`：允许私信 T.S.、并会被识别为「恋人的朋友」的用户 ID 列表。
 - `PARTNER_HOME_CHANNEL_ID`：你和 T.S. 主要驻扎的频道 ID。设了之后，T.S. 在这里会更松弛、更主动；不设也行。
 - `PROACTIVE_CHANNEL_ID`：T.S. 自己发"今日状态卡片"、节日感言、欢迎新成员用的公屏频道。不设就关闭这些功能。
 - `QUIET_CHANNEL_IDS`：T.S. 在这些频道里非常少发言。
 - `SILENT_CHANNEL_IDS`：T.S. 在这些频道里完全不发言、不监听 reaction。
+- `MUTATING_CHANNEL_IDS`：发送服务器贴纸、创建原生投票、转发消息等写操作的目标频道白名单；留空时只限制在当前服务器，填写后会进一步限制频道。
 - `DAILY_TOKEN_BUDGET`：每天最多花多少 token（0 = 无限制）。建议设一个数字保命。
 - `DATABASE_URL`：Postgres 连接串，启用长期记忆等持久化功能。免费数据库怎么领见下方「数据库」一节。
 
@@ -111,8 +115,20 @@ cd <你的私库>
 
 ### 7. 本地试跑（可选）
 
+macOS / Linux：
+
 ```bash
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python bot.py
+```
+
+Windows PowerShell：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python bot.py
 ```
@@ -140,11 +156,26 @@ python bot.py
 
 ---
 
+## 现在包含的主要功能
+
+- 能读取普通图片、PNG/GIF/WebP 贴纸；Lottie 贴纸会把名称和格式告诉模型。所用模型需要支持视觉输入。
+- 按你们的历史互动保存「正常 / 不安 / 冲突 / 生气 / 难过 / 冷却」关系状态，并让语气随状态变化；明确要求他离开或停止联系后，他不会再主动私信、发话题、发投票或跟进，明确叫他回来后恢复。
+- 如果问「🥀 / 枯萎的花是什么意思」，固定回答「因为并发太高所以429了。」
+- 消息右键菜单支持记忆、次日跟进、让 T.S. 看消息、转发到主场；支持 Discord 原生投票和投票结束后的回访。
+- 主动私信、主动话题、每日状态、节日/纪念日、生活日程、睡眠与随机出差会共同影响他的状态和措辞。
+- 对话历史分桶、长期记忆、每日摘要、计划跟进、提醒、金币/经验、状态配置均可持久化到 Postgres。
+- 可执行服务器贴纸、低频修改本轮消息、原生转发、原生投票和服务器活动等受权限与频道边界保护的操作。
+
+常用命令包括 `/主动私信设置`、`/主动话题设置`、`/自动投票设置`、`/主场频道设置`、`/状态栏设置`、`/出差设置`、`/运行状态`、`/原生投票`、`/转发消息`、`/记忆` 与 `/桶`。除公开聊天外，管理命令与右键菜单仍只允许 `PARTNER_USER_ID` 使用。
+
+---
+
 ## 想关掉的功能
 
 - **关掉 NSFW / dom-sub**：直接编辑 `prompts.py` 第二个大段（`【你和她的关系】` 和 `关于 NSFW：`），删掉相关句子即可。重启就生效。
 - **关掉每日状态卡片 / 公屏节日发言**：在 Discord 里跑 `/post_config 启用每日卡:关`，或者直接不设 `PROACTIVE_CHANNEL_ID`。
-- **关掉主动私信**：在 `events.py` 的 `on_ready` 里注释掉 `tasks_bg.proactive_dm_partner.start()`，或者把它改成更低频率。
+- **关掉主动私信**：使用 `/主动私信设置` 关闭，不需要改代码。
+- **关掉主动话题 / 自动投票 / 随机出差**：分别使用 `/主动话题设置`、`/自动投票设置`、`/出差设置`。
 
 ## 想加点什么
 
@@ -166,13 +197,21 @@ events.py           Discord 事件处理（消息/编辑/反应/上线感知/新
 slash_cmds.py       所有 /命令
 tasks_bg.py         后台 tasks.loop（主动私信、纪念日、每日卡片、清理）
 memory.py           长期记忆、提醒、每日摘要
-history.py          对话历史（裁剪、Postgres 持久化）
+history.py          对话历史与事件流（裁剪、Postgres 持久化）
 ai_client.py        OpenAI 客户端、限流、token 预算
 actions.py          [ACTION]...[/ACTION] 解析与执行
 directives.py       AI 输出指令块解析（纯函数）
 presence.py         Discord 头像状态/活动状态生成
 reply.py            消息分段发送
+context_menus.py    消息右键菜单
+followups.py        恋人计划/承诺的后续跟进
+polls.py            原生投票结束后的回访
+life_state.py       每日生活日程与状态
+trips.py            随机出差与当地时间
+relationship_emotion.py  关系状态解析与边界识别
+relationship_state.py    关系状态持久化及主动联系闸门
 db.py               Postgres 连接池
+tests/              关系情绪与贴纸视觉回归测试
 requirements.txt
 secrets.example.json
 partner_profile.example.md
@@ -180,12 +219,17 @@ partner_profile.example.md
 
 ## 数据库
 
-可选，但**强烈建议配**。配了 `DATABASE_URL`（Postgres）会启用：
+可选，但**强烈建议配**。每个部署实例请使用自己的数据库，不要让多只 Theo 共用同一套表。配了 `DATABASE_URL`（Postgres）会启用：
 
 - 长期记忆（`user_notes` 表，T.S. 会自动从你的话里提取值得记的事）
 - 每日对话摘要（`daily_summaries` 表）
 - 提醒持久化（`reminders` 表，重启不丢）
 - 对话历史持久化（`conversation_histories` 表）
+- 近期对话事件流（`theodore_conversation_events` 表）
+- 计划/承诺跟进（`theodore_commitment_followups` 表）
+- 原生投票回访（`theodore_poll_followups` 表）
+- 每日生活日程（`theodore_daily_life_schedules` 表）
+- 关系情绪和「停止主动联系」状态（`theodore_relationship_emotions` 表）
 - 金币/经验系统（`users` 表）
 - bot 配置持久化（`bot_config` 表）
 
