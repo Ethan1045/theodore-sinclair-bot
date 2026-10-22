@@ -703,7 +703,6 @@ async def extract_and_save_memory(user_id: str, user_message: str):
 
     try:
         response = await ai_chat_create(
-            model=config.MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=1200,
             temperature=0.1,
@@ -837,7 +836,6 @@ async def _generate_consolidated_memory(source_rows: list, span: str) -> str | N
     )
     try:
         response = await ai_chat_create(
-            model=config.MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=700,
             temperature=0.2,
@@ -973,7 +971,6 @@ async def prune_memories_if_needed(user_id: str):
             + f"\n\n请选择 {to_merge} 条。只输出一行：MERGE: 12,17,23"
         )
         response = await ai_chat_create(
-            model=config.MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=400,
             temperature=0.1,

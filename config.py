@@ -136,24 +136,7 @@ def _read_id_set(key: str) -> set[int]:
 
 # ==== 密钥 ====
 DISCORD_TOKEN = (os.getenv("DISCORD_TOKEN", "").strip() or str(_secrets.get("DISCORD_TOKEN", "")).strip())
-API_KEY = (
-    os.getenv("OPENAI_API_KEY", "").strip()
-    or os.getenv("API_KEY", "").strip()
-    or str(_secrets.get("OPENAI_API_KEY", "")).strip()
-    or str(_secrets.get("API_KEY", "")).strip()
-)
-BASE_URL = (
-    os.getenv("OPENAI_BASE_URL", "").strip()
-    or os.getenv("BASE_URL", "").strip()
-    or str(_secrets.get("OPENAI_BASE_URL", "")).strip()
-    or str(_secrets.get("BASE_URL", "")).strip()
-    or "https://api.openai.com/v1/"
-)
-MODEL_NAME = (
-    os.getenv("MODEL_NAME", "").strip()
-    or str(_secrets.get("MODEL_NAME", "")).strip()
-    or "gpt-4o"
-)
+# API 线路、密钥和模型仅从 /api配置 的加密数据库配置读取。
 DATABASE_URL = (
     os.getenv("DATABASE_URL", "").strip()
     or str(_secrets.get("DATABASE_URL", "")).strip()
@@ -177,8 +160,6 @@ DM_WHITELIST_IDS = {PARTNER_USER_ID} | PARTNER_FRIEND_IDS
 # ==== 启动检查 ====
 if not DISCORD_TOKEN:
     raise RuntimeError("缺少 DISCORD_TOKEN（环境变量或 secrets.local.json）")
-if not API_KEY:
-    raise RuntimeError("缺少 OPENAI_API_KEY/API_KEY（环境变量或 secrets.local.json）")
 if not PARTNER_USER_ID:
     raise RuntimeError("缺少 PARTNER_USER_ID 配置（请在 secrets.local.json 或环境变量里设置）")
 

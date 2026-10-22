@@ -27,7 +27,7 @@
 
 ### 1. 从模板创建你自己的私库
 
-在本仓库右上角点 **「Use this template」 → Create a new repository**，名字随便起，**Visibility 一定选 Private**（你要在里面填密钥）。
+在本仓库右上角点 **「Use this template」 → Create a new repository**，名字随便起，推荐选择 **Private**。密钥仅保存在托管平台、本地忽略文件或加密数据库中，不提交到仓库。
 
 > ⚠️ 不要 Fork。Fork 出来的仓库默认是 public，密钥推上去全网可见。
 
@@ -47,8 +47,10 @@
 
 T.S. 用任何 OpenAI 兼容的 API 都能跑。最常见的两条路：
 
-- **OpenAI 官方**（最稳）：<https://platform.openai.com>，建 key，`OPENAI_BASE_URL` 填 `https://api.openai.com/v1/`，`MODEL_NAME` 填 `gpt-4o` 或 `gpt-4o-mini`。
-- **第三方代理**（便宜，能用 Gemini/Claude 等）：自行搜索。`OPENAI_BASE_URL` 填代理的地址，`MODEL_NAME` 按代理支持的型号填。
+- 向你选择的 OpenAI 兼容 API 提供方申请密钥，确认接口地址和支持的模型。
+- Bot 上线后，由配置的恋人运行 **`/api配置`**，添加线路、填写密钥，再填写或拉取模型。
+- 可配置主线路与副线路；保存后立即生效，密钥加密保存到 PostgreSQL，不会在面板回显。
+- 不再读取旧的 API 环境变量或本地 API 配置字段；未配置线路时只提示配置，不使用默认接口。
 
 ⚠️ 务必给 API 设一个支付上限或者每日额度，避免 bot 失控烧光你的额度。代码层面有 `DAILY_TOKEN_BUDGET` 一道保险（见下），但它只是软门槛，不能替代你账户的硬上限。
 
@@ -74,9 +76,7 @@ cd <你的私库>
 ```json
 {
   "DISCORD_TOKEN": "MTQ...你的 bot token",
-  "OPENAI_API_KEY": "sk-...你的 api key",
-  "OPENAI_BASE_URL": "https://api.openai.com/v1/",
-  "MODEL_NAME": "gpt-4o",
+  "DATABASE_URL": "填入你自己的 PostgreSQL 连接串，不要提交",
   "DAILY_TOKEN_BUDGET": 200000,
 
   "PARTNER_USER_ID": 12345678901234567,
@@ -99,7 +99,7 @@ cd <你的私库>
 - `SILENT_CHANNEL_IDS`：T.S. 在这些频道里完全不发言、不监听 reaction。
 - `MUTATING_CHANNEL_IDS`：发送服务器贴纸、创建原生投票、转发消息等写操作的目标频道白名单；留空时只限制在当前服务器，填写后会进一步限制频道。
 - `DAILY_TOKEN_BUDGET`：每天最多花多少 token（0 = 无限制）。建议设一个数字保命。
-- `DATABASE_URL`：Postgres 连接串，启用长期记忆等持久化功能。免费数据库怎么领见下方「数据库」一节。
+- `DATABASE_URL`（**必填**）：Postgres 连接串，用于加密保存指令配置的 API，以及长期记忆等持久化功能。数据库准备方法见下方「数据库」一节。
 
 每个字段更详细的解释，`secrets.example.json` 里以 `_` 开头的注释键都写明白了，照着填即可。
 
@@ -143,7 +143,7 @@ python bot.py
 
 1. 注册 Railway，**New Project → Deploy from GitHub repo**，选你的私库。
 2. 在 **Variables** 标签里，把 `secrets.local.json` 里的每个字段都加成环境变量。代码会优先读环境变量，没有再读本地文件。
-3. （可选）加一个 Postgres 数据库：**New → Database → PostgreSQL**，然后在 bot 服务的 **Variables** 加一个 `DATABASE_URL` 指向数据库（Railway 提供模板字符串）。不加 Postgres 也能跑，只是没有长期记忆和提醒持久化。
+3. 准备一个 Postgres 数据库，并设置 `DATABASE_URL`。这是安全持久化 API 密钥所必需的；不要把连接串提交到仓库。
 4. **Deploy**。
 
 #### Render / Zeabur / 自己的 VPS
@@ -152,7 +152,9 @@ python bot.py
 
 ### 9. 完成
 
-在 Discord 里 @ 你的 bot 试试。如果他回复了，你就成了；如果没有，去看托管平台的日志，排错。
+先由 `PARTNER_USER_ID` 对应的账号运行 `/api配置`，添加 API 线路和模型；如果指令还没出现，可运行 `/同步指令` 或等待 Discord 刷新。再 @ Bot 验证回复。API 配置只对该账号开放，所有面板回复均为私密回复。
+
+数据库中的 API 密钥沿用 Bot Token 派生的加密方式。不要为了取消 API 环境变量而删除或更换 `DISCORD_TOKEN`；更换它会使旧 API 密钥无法解密，需要重新通过指令录入。
 
 ---
 
@@ -199,6 +201,7 @@ tasks_bg.py         后台 tasks.loop（主动私信、纪念日、每日卡片�
 memory.py           长期记忆、提醒、每日摘要
 history.py          对话历史与事件流（裁剪、Postgres 持久化）
 ai_client.py        OpenAI 客户端、限流、token 预算
+api_runtime.py      加密 API 线路、主副切换与专属配置面板
 actions.py          [ACTION]...[/ACTION] 解析与执行
 directives.py       AI 输出指令块解析（纯函数）
 presence.py         Discord 头像状态/活动状态生成
@@ -219,7 +222,7 @@ partner_profile.example.md
 
 ## 数据库
 
-可选，但**强烈建议配**。每个部署实例请使用自己的数据库，不要让多只 Theo 共用同一套表。配了 `DATABASE_URL`（Postgres）会启用：
+**必填**：指令配置的 API 密钥需要加密持久化到 PostgreSQL。每个部署实例请使用自己的数据库，不要让多只 Bot 共用同一套表。配置 `DATABASE_URL` 后还会启用：
 
 - 长期记忆（`user_notes` 表，T.S. 会自动从你的话里提取值得记的事）
 - 每日对话摘要（`daily_summaries` 表）
@@ -233,7 +236,7 @@ partner_profile.example.md
 - 金币/经验系统（`users` 表）
 - bot 配置持久化（`bot_config` 表）
 
-不配也能跑,但所有数据都存在内存里——**bot 一重启（托管平台随时可能重启你的服务）记忆、提醒、金币全部清零**。也就是说不配数据库的 T.S. 是「失忆体质」。
+未配置数据库时不会启用聊天 API；先设置 `DATABASE_URL`，再通过 `/api配置` 添加线路。不支持把 API 密钥明文保存到本地文件或环境变量作为替代。
 
 ### 免费 Postgres 去哪领
 

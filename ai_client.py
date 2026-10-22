@@ -3,13 +3,20 @@ import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from openai import AsyncOpenAI
+from api_runtime import ApiRuntime
+import hashlib
 
 import config
 import state
 
 
-ai_client = AsyncOpenAI(api_key=config.API_KEY, base_url=config.BASE_URL, timeout=config.LLM_TIMEOUT_SECONDS)
+api_runtime = ApiRuntime(
+    scope="theodore:" + hashlib.sha256(config.DISCORD_TOKEN.encode("utf-8")).hexdigest()[:16],
+    database_url=config.DATABASE_URL,
+    master_secret=config.DISCORD_TOKEN,
+    timeout=config.LLM_TIMEOUT_SECONDS,
+)
+ai_client = api_runtime
 _raw_completions = ai_client.chat.completions
 
 
@@ -107,7 +114,6 @@ async def call_ai(history: list) -> str:
     while True:
         try:
             response = await ai_chat_create(
-                model=config.MODEL_NAME,
                 messages=history,
             )
             content = response.choices[0].message.content if response.choices else ""

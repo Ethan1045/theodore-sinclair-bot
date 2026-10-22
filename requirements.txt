@@ -1,5 +1,2 @@
-discord.py>=2.6,<3
-openai
-psycopg[binary]
-psycopg-pool
-aiohttp
+# Locked dependencies for Python 3.13; edit requirements.in and regenerate the lock.
+-r requirements.lock

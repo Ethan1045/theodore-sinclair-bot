@@ -16,7 +16,8 @@ import trips
 import presence as presence_mod
 from life_state import refresh_life_state
 from client import discord_client, slash_tree
-from ai_client import call_ai
+from ai_client import call_ai, api_runtime
+from api_runtime import ApiConfigPanel
 from history import get_history, history_key_for, trim_history, delete_persisted_history, _msg_to_plain_text
 from memory import _THEODORE_BOT_SCOPE, add_reminder, save_persisted_config
 from presence import get_london_weather
@@ -29,6 +30,31 @@ from prompts import SYSTEM_PROMPT
 
 memory_group = app_commands.Group(name="记忆", description="恋人专属：管理T.S.的记忆")
 bucket_group = app_commands.Group(name="桶", description="恋人专属：管理对话历史桶")
+
+
+async def _api_owner_check(interaction: discord.Interaction) -> bool:
+    return interaction.user.id == config.PARTNER_USER_ID
+
+
+_api_config_panel = ApiConfigPanel(api_runtime, _api_owner_check)
+
+
+@slash_tree.command(name="api配置", description="恋人专属：安全配置主 API、副 API 与模型")
+async def slash_api_config(interaction: discord.Interaction):
+    await _api_config_panel.send(interaction)
+
+
+@slash_tree.command(name="同步指令", description="恋人专属：立即同步全局斜杠指令")
+async def slash_sync_commands(interaction: discord.Interaction):
+    if not await _api_owner_check(interaction):
+        await interaction.response.send_message("这个指令只允许配置的恋人使用。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        synced = await slash_tree.sync()
+        await interaction.followup.send(f"✅ 已同步 {len(synced)} 条指令。", ephemeral=True)
+    except Exception as exc:
+        await interaction.followup.send(f"❌ 同步失败（{type(exc).__name__}），请检查 Bot 的指令权限。", ephemeral=True)
 
 
 def _clean_ai(raw: str) -> list[str]:

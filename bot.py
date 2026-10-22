@@ -65,12 +65,16 @@ async def run_bot():
             await asyncio.sleep(30)
 
 
-if os.name == "nt":
-    # Python 3.13 的 Windows 默认循环是 ProactorEventLoop，而 psycopg 的
-    # 异步连接需要 SelectorEventLoop。显式传入工厂，避免依赖全局策略。
-    asyncio.run(
-        run_bot(),
-        loop_factory=lambda: asyncio.SelectorEventLoop(selectors.SelectSelector()),
-    )
-else:
-    asyncio.run(run_bot())
+def main():
+    if os.name == "nt":
+        # psycopg 的异步连接在 Windows 上需要 SelectorEventLoop。
+        asyncio.run(
+            run_bot(),
+            loop_factory=lambda: asyncio.SelectorEventLoop(selectors.SelectSelector()),
+        )
+    else:
+        asyncio.run(run_bot())
+
+
+if __name__ == "__main__":
+    main()

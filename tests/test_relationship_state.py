@@ -2,7 +2,6 @@ import os
 import unittest
 
 os.environ.setdefault("DISCORD_TOKEN", "test-token")
-os.environ.setdefault("OPENAI_API_KEY", "test-key")
 os.environ.setdefault("PARTNER_USER_ID", "1")
 os.environ["DATABASE_URL"] = ""
 

@@ -1,0 +1,2 @@
+# Locked dependencies for Python 3.13; edit requirements-dev.in and regenerate the lock.
+-r requirements-dev.lock

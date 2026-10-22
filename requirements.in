@@ -1,0 +1,6 @@
+discord.py>=2.6,<3
+openai
+psycopg[binary]
+psycopg-pool
+aiohttp
+cryptography>=42,<47

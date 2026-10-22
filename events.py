@@ -11,7 +11,7 @@ import discord
 import config
 import state
 from client import discord_client, slash_tree
-from ai_client import call_ai
+from ai_client import call_ai, api_runtime
 from history import (
     get_history, history_key_for, trim_history, load_all_histories, _msg_to_plain_text,
     ensure_conversation_events_table, record_conversation_event,
@@ -284,6 +284,14 @@ async def on_ready():
     await ensure_users_table()
     await ensure_daily_summaries_table()
     await ensure_bot_config_table()
+    api_config_ready = False
+    commands_ready = False
+    try:
+        await api_runtime.initialize()
+        api_config_ready = bool(api_runtime.database_url)
+        print(f"✅ API 运行时配置已载入：{len(api_runtime.profiles())} 条")
+    except Exception as exc:
+        print(f"⚠️ API 配置载入失败（{type(exc).__name__}）；不会使用环境变量，请检查数据库并刷新 /api配置。")
     await ensure_reminders_table()
     await ensure_conversation_history_table()
     await ensure_conversation_events_table()
@@ -310,6 +318,7 @@ async def on_ready():
         print(f"⚠️ 调整状态栏/主动私信周期失败: {e}")
     try:
         synced = await slash_tree.sync()
+        commands_ready = True
         print(f"✅ Slash commands 已同步: {len(synced)} 条")
     except Exception as e:
         print(f"⚠️ Slash commands 同步失败: {e}")
@@ -353,6 +362,8 @@ async def on_ready():
         tasks_bg.poll_followup_check.start()
     if not tasks_bg.trip_scheduler_check.is_running():
         tasks_bg.trip_scheduler_check.start()
+    if api_config_ready and commands_ready:
+        print("DEPLOYMENT_READY service=theodore-sinclair-bot")
 
 
 @discord_client.event

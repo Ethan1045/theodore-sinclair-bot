@@ -226,7 +226,6 @@ async def generate_daily_card_data(weather: str | None = None) -> dict | None:
     for attempt in range(2):
         try:
             response = await ai_chat_create(
-                model=config.MODEL_NAME,
                 messages=messages,
                 max_tokens=8192,
                 temperature=0.7,
@@ -479,7 +478,6 @@ async def daily_summary_task():
             f"{joined}\n\n摘要："
         )
         response = await ai_chat_create(
-            model=config.MODEL_NAME,
             messages=[
                 {"role": "system", "content": "为沈玘言整理他与恋人共同经历的私人记忆。只写沉浸式的第一人称事实，不使用任何AI或后台术语。"},
                 {"role": "user", "content": prompt},
@@ -1322,7 +1320,6 @@ async def random_forum_post():
             "现在输出："
         )
         response = await ai_chat_create(
-            model=config.MODEL_NAME,
             messages=[
                 {"role": "system", "content": "你是一个JSON生成助手。用户会描述需要的字段，你只输出一个合法的JSON对象，不加任何多余文字。"},
                 {"role": "user", "content": prompt},

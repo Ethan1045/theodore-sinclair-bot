@@ -70,7 +70,6 @@ async def _summarize_block(messages: list[dict]) -> str:
     )
     try:
         resp = await ai_chat_create(
-            model=config.MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
             temperature=0.3,

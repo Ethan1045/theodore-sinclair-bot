@@ -173,7 +173,6 @@ async def generate_presence() -> tuple[str, discord.ActivityType, str]:
     )
     try:
         response = await ai_chat_create(
-            model=config.MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=512,
             temperature=0.9,
@@ -268,7 +267,6 @@ async def generate_custom_bubble() -> str:
 
     try:
         response = await ai_chat_create(
-            model=config.MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=512,
             temperature=0.9,
