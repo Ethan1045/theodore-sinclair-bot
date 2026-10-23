@@ -82,6 +82,7 @@ partner_last_seen_online: datetime | None = None
 
 # ==== 睡眠期间待回复消息 ====
 sleep_pending_messages: list[dict] = []
+sleep_pending_lock: "asyncio.Lock | None" = None
 
 # ==== 节日发言防重复 ====
 _last_occasion_date: str = ""
@@ -97,6 +98,7 @@ _recent_presences: list[str] = []
 # ==== 对话历史 ====
 _histories: dict[str, list[dict]] = {}
 _dirty_history_buckets: set[str] = set()
+_history_revisions: dict[str, int] = {}
 _bucket_locks: dict[str, asyncio.Lock] = {}
 _bucket_touched: dict[str, datetime] = {}
 # 正在做 LLM 摘要压缩的桶，避免并发重复摘要（trim_history 用）
@@ -162,11 +164,13 @@ _token_usage: dict = {"date": None, "prompt": 0, "completion": 0, "total": 0, "c
 
 
 def _ensure_locks() -> None:
-    global history_lock, reminders_lock, _merge_lock, _bg_lock
+    global history_lock, reminders_lock, sleep_pending_lock, _merge_lock, _bg_lock
     if history_lock is None:
         history_lock = asyncio.Lock()
     if reminders_lock is None:
         reminders_lock = asyncio.Lock()
+    if sleep_pending_lock is None:
+        sleep_pending_lock = asyncio.Lock()
     if _merge_lock is None:
         _merge_lock = asyncio.Lock()
     if _bg_lock is None:
@@ -192,6 +196,7 @@ def mark_history_dirty(key: str) -> None:
     if key.startswith("dm:") and key != f"dm:{PARTNER_USER_ID}":
         return
     _dirty_history_buckets.add(key)
+    _history_revisions[key] = _history_revisions.get(key, 0) + 1
 
 
 def spawn_bg(coro, *, name: str = "bg"):

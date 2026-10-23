@@ -130,6 +130,7 @@ async def trim_history(key: str = config.SYSTEM_HISTORY_KEY):
             h.append(system_msg)
             h.append(digest)
             h.extend(recent)
+            state.mark_history_dirty(key)
     finally:
         state._trimming.discard(key)
 
@@ -189,29 +190,49 @@ def _deserialize_history(saved: list) -> list[dict]:
     return hist
 
 
-async def flush_dirty_histories():
+_WAKEUP_CONTEXT_PREFIX = "（睡着期间收到、醒后补看的消息）"
+
+
+def _drop_unanswered_wakeup_contexts(hist: list[dict]) -> bool:
+    """移除旧版本留下的单边醒后 user 记录，避免主动消息再次回答。"""
+    kept: list[dict] = []
+    changed = False
+    for index, message in enumerate(hist):
+        content = _msg_to_plain_text(message)
+        is_wakeup = (
+            str(message.get("source") or "").startswith("wakeup:")
+            or content.startswith(_WAKEUP_CONTEXT_PREFIX)
+        )
+        next_role = hist[index + 1].get("role") if index + 1 < len(hist) else None
+        if message.get("role") == "user" and is_wakeup and next_role != "assistant":
+            changed = True
+            continue
+        kept.append(message)
+    if changed:
+        hist[:] = kept
+    return changed
+
+
+async def _persist_history_key(key: str) -> bool:
+    """在分桶锁内保存最新快照，防止旧快照覆盖刚完成的醒后回复。"""
     if not config.DATABASE_URL:
-        state._dirty_history_buckets.clear()
-        return
-    keys = list(state._dirty_history_buckets)
-    state._dirty_history_buckets.clear()
-    if not keys:
-        return
-    payloads: list[tuple[str, str]] = []
-    for key in keys:
-        hist = state._histories.get(key)
-        if not hist:
-            continue
-        serialized = _serialize_history(hist)
-        if not serialized:
-            continue
-        payloads.append((key, _json.dumps(serialized, ensure_ascii=False)))
-    if not payloads:
-        return
+        state._dirty_history_buckets.discard(key)
+        return True
+    lock = state.get_bucket_lock(key)
     try:
-        async with _db.db_conn() as conn:
-            async with conn.cursor() as cur:
-                for key, blob in payloads:
+        async with lock:
+            hist = state._histories.get(key)
+            if not hist:
+                state._dirty_history_buckets.discard(key)
+                return True
+            serialized = _serialize_history(hist)
+            if not serialized:
+                state._dirty_history_buckets.discard(key)
+                return True
+            blob = _json.dumps(serialized, ensure_ascii=False)
+            revision = state._history_revisions.get(key, 0)
+            async with _db.db_conn() as conn:
+                async with conn.cursor() as cur:
                     await cur.execute(
                         """INSERT INTO conversation_histories (bucket_key, messages, updated_at)
                            VALUES (%s, %s::jsonb, NOW())
@@ -219,15 +240,32 @@ async def flush_dirty_histories():
                            DO UPDATE SET messages = EXCLUDED.messages, updated_at = NOW()""",
                         (key, blob),
                     )
-            await conn.commit()
+                await conn.commit()
+            if state._history_revisions.get(key, 0) == revision:
+                state._dirty_history_buckets.discard(key)
+            return True
     except Exception as e:
-        for key, _ in payloads:
-            state._dirty_history_buckets.add(key)
-        print(f"⚠️ 持久化对话历史失败（{len(payloads)} 个桶）：{e}")
+        state._dirty_history_buckets.add(key)
+        print(f"⚠️ 持久化对话历史 {key} 失败：{e}")
+        return False
+
+
+async def persist_history_now(key: str) -> bool:
+    """高价值对话立即落库；失败时保留 dirty 标记供周期任务重试。"""
+    return await _persist_history_key(key)
+
+
+async def flush_dirty_histories():
+    if not config.DATABASE_URL:
+        state._dirty_history_buckets.clear()
+        return
+    for key in list(state._dirty_history_buckets):
+        await _persist_history_key(key)
 
 
 async def delete_persisted_history(key: str) -> None:
     state._dirty_history_buckets.discard(key)
+    state._history_revisions.pop(key, None)
     if not config.DATABASE_URL:
         return
     try:
@@ -260,13 +298,20 @@ async def load_all_histories():
         try:
             saved = messages if isinstance(messages, list) else _json.loads(messages)
             hist = _deserialize_history(saved)
+            repaired = _drop_unanswered_wakeup_contexts(hist)
             if len(hist) <= 1:
+                if repaired:
+                    await delete_persisted_history(bucket_key)
                 continue
             # 旧版主动私信与睡醒补回只写 assistant、不写 user，久而久之会把
             # DM 桶灌成一串 Morning。这样的单边记录不是对话，不恢复进模型上下文。
             if not any(msg.get("role") == "user" for msg in hist[1:]):
+                if repaired:
+                    await delete_persisted_history(bucket_key)
                 continue
             state._histories[bucket_key] = hist
+            if repaired:
+                state.mark_history_dirty(bucket_key)
             if updated_at is not None:
                 state._bucket_touched[bucket_key] = updated_at
             restored += 1

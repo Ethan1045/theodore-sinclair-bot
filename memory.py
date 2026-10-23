@@ -366,6 +366,7 @@ _PERSISTED_CONFIG_KEYS: dict[str, type] = {
     "PRESENCE_TRANSIENT_ENABLED": bool,
     "PRESENCE_TRANSIENT_CHANCE": float,
     "PRESENCE_TRANSIENT_MINUTES": int,
+    "PARTNER_SLEEP_PENDING_MESSAGES": str,
 }
 
 
@@ -405,6 +406,39 @@ async def load_persisted_config():
 
 def _apply_persisted_config(parsed: dict) -> None:
     import tasks_bg
+    if "PARTNER_SLEEP_PENDING_MESSAGES" in parsed:
+        try:
+            loaded = json.loads(parsed["PARTNER_SLEEP_PENDING_MESSAGES"])
+        except (TypeError, ValueError) as exc:
+            print(f"⚠️ 睡眠待回复队列解析失败: {exc}")
+            loaded = []
+        if isinstance(loaded, list):
+            combined = list(state.sleep_pending_messages)
+            seen = {
+                (int(item.get("channel_id", 0)), int(item.get("message_id", 0)))
+                for item in combined if isinstance(item, dict)
+            }
+            for item in loaded[-500:]:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    entry = {
+                        "channel_id": int(item["channel_id"]),
+                        "message_id": int(item["message_id"]),
+                        "user_id": int(item["user_id"]),
+                        "display_name": str(item.get("display_name") or "")[:200],
+                        "text": str(item.get("text") or "")[:4000],
+                        "is_dm": bool(item.get("is_dm")),
+                        "ts": str(item.get("ts") or ""),
+                        "drowsy": bool(item.get("drowsy")),
+                    }
+                except (KeyError, TypeError, ValueError):
+                    continue
+                identity = (entry["channel_id"], entry["message_id"])
+                if identity not in seen:
+                    combined.append(entry)
+                    seen.add(identity)
+            state.sleep_pending_messages[:] = combined[-500:]
     if "PARTNER_HOME_CHANNEL_ID" in parsed:
         config.PARTNER_HOME_CHANNEL_ID = parsed["PARTNER_HOME_CHANNEL_ID"]
     if "DAILY_CARD_PROB_NORMAL" in parsed:
@@ -495,7 +529,7 @@ def _apply_persisted_config(parsed: dict) -> None:
 
 async def save_persisted_config(updates: dict):
     if not config.DATABASE_URL or not updates:
-        return
+        return True
     try:
         async with _db.db_conn() as conn:
             async with conn.cursor() as cur:
@@ -510,8 +544,10 @@ async def save_persisted_config(updates: dict):
                         (key, str(value)),
                     )
                 await conn.commit()
+        return True
     except Exception as e:
         print(f"⚠️ 写入 bot_config 失败: {e}")
+        return False
 
 
 # ==== 提醒系统 ====

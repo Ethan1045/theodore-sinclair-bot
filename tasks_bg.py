@@ -19,7 +19,7 @@ from history import (
     get_history, trim_history, history_key_for,
     flush_dirty_histories, delete_persisted_history, _msg_to_plain_text,
     fetch_conversation_events_for_day, prune_conversation_events,
-    record_conversation_event, remember_outbound_context,
+    record_conversation_event, remember_outbound_context, persist_history_now,
 )
 from memory import (
     _THEODORE_BOT_SCOPE, delete_reminder, ensure_daily_summaries_table,
@@ -100,6 +100,9 @@ _last_daily_card_date: str = ""
 # ==== 每日摘要防重复 ====
 _daily_summary_done_for: date | None = None
 
+SLEEP_PENDING_CONFIG_KEY = "PARTNER_SLEEP_PENDING_MESSAGES"
+_wakeup_catchup_task: asyncio.Task | None = None
+
 
 def _attach_loop_error_handler(loop_obj, name: str):
     async def _on_err(exc: BaseException):
@@ -112,6 +115,55 @@ def _attach_loop_error_handler(loop_obj, name: str):
             except Exception as e:
                 print(f"❌ 后台任务 {name} 重启失败：{e}")
     loop_obj.error(_on_err)
+
+
+def _sleep_entry_identity(entry: dict) -> tuple[int, int]:
+    return int(entry.get("channel_id", 0)), int(entry.get("message_id", 0))
+
+
+async def _persist_sleep_pending_locked() -> bool:
+    from memory import save_persisted_config
+    payload = json.dumps(state.sleep_pending_messages[-500:], ensure_ascii=False)
+    return bool(await save_persisted_config({SLEEP_PENDING_CONFIG_KEY: payload}))
+
+
+async def queue_sleep_pending(entry: dict) -> None:
+    """去重加入睡眠待回复队列，并立刻持久化，避免重启丢消息。"""
+    state._ensure_locks()
+    identity = _sleep_entry_identity(entry)
+    async with state.sleep_pending_lock:
+        if not any(_sleep_entry_identity(old) == identity for old in state.sleep_pending_messages):
+            state.sleep_pending_messages.append(entry)
+        await _persist_sleep_pending_locked()
+
+
+async def _remove_sleep_pending(entries: list[dict]) -> bool:
+    state._ensure_locks()
+    identities = {_sleep_entry_identity(entry) for entry in entries}
+    async with state.sleep_pending_lock:
+        state.sleep_pending_messages[:] = [
+            entry for entry in state.sleep_pending_messages
+            if _sleep_entry_identity(entry) not in identities
+        ]
+        return await _persist_sleep_pending_locked()
+
+
+async def _clear_sleep_pending() -> bool:
+    state._ensure_locks()
+    async with state.sleep_pending_lock:
+        state.sleep_pending_messages.clear()
+        return await _persist_sleep_pending_locked()
+
+
+def start_wakeup_catchup() -> asyncio.Task | None:
+    """确保同一时刻最多只有一个醒后补回任务。"""
+    global _wakeup_catchup_task
+    if _wakeup_catchup_task is not None and not _wakeup_catchup_task.done():
+        return _wakeup_catchup_task
+    if not state.sleep_pending_messages:
+        return None
+    _wakeup_catchup_task = state.spawn_bg(_wakeup_catchup(), name="wakeup_catchup")
+    return _wakeup_catchup_task
 
 
 async def _partner_blocked_proactive() -> bool:
@@ -1157,19 +1209,19 @@ def _should_rotate_presence() -> bool:
 
 
 async def _wakeup_catchup():
-    """睡醒后补回复：把睡眠期间收到的消息打包，按频道分组，逐个补回复。"""
+    """睡醒后补回复；成功发送并成对落库后才移出持久队列。"""
     if await _partner_blocked_proactive():
-        state.sleep_pending_messages.clear()
+        await _clear_sleep_pending()
         return
-    pending = list(state.sleep_pending_messages)
-    state.sleep_pending_messages.clear()
+    state._ensure_locks()
+    async with state.sleep_pending_lock:
+        pending = list(state.sleep_pending_messages)
     if not pending:
         return
 
     await asyncio.sleep(random.uniform(60, 180))
 
     from ai_client import call_ai
-    from reply import send_ai_reply
 
     by_channel: dict[int, list[dict]] = {}
     for entry in pending:
@@ -1215,29 +1267,85 @@ async def _wakeup_catchup():
             else:
                 hist_key = history_key_for(channel=channel)
 
-            hist = get_history(hist_key)
             pending_context = f"（睡着期间收到、醒后补看的消息）\n{summary}"
+            wakeup_source = f"wakeup:{ch_id}:{last_entry['message_id']}"
             async with state.get_bucket_lock(hist_key):
-                hist.append({"role": "user", "content": pending_context})
-                state.mark_history_dirty(hist_key)
-            state.spawn_bg(
-                record_conversation_event(hist_key, "user", pending_context),
-                name=f"daily-event:wakeup:{hist_key}",
-            )
-            temp_history = hist.copy()
+                hist = get_history(hist_key)
+                already_answered = any(
+                    item.get("role") == "assistant" and item.get("source") == wakeup_source
+                    for item in hist
+                )
+                temp_history = hist.copy()
+            if already_answered:
+                if await persist_history_now(hist_key):
+                    await _remove_sleep_pending(entries)
+                continue
+
+            temp_history.append({"role": "user", "content": pending_context})
             temp_history.append({"role": "user", "content": prompt})
 
             raw_reply = await call_ai(temp_history)
             if "[IGNORE]" in raw_reply.upper():
+                print(f"⚠️ 醒后补回复被模型忽略，保留待重试: 频道 {ch_id}")
                 continue
 
-            if last_message:
-                await send_ai_reply(raw_reply, last_message, channel)
-            else:
-                _, msgs, _, _, _ = parse_bot_directives(raw_reply)
-                for msg_text in msgs:
-                    await channel.send(msg_text)
+            _, msgs, _, _, _ = parse_bot_directives(raw_reply)
+            msgs = [msg_text.strip() for msg_text in msgs if msg_text.strip()]
+            if not msgs:
+                print(f"⚠️ 醒后补回复没有可发送内容，保留待重试: 频道 {ch_id}")
+                continue
+
+            sent: list[str] = []
+            for index, msg_text in enumerate(msgs):
+                try:
+                    if index == 0 and last_message is not None:
+                        try:
+                            await last_message.reply(
+                                msg_text, mention_author=False, fail_if_not_exists=False,
+                            )
+                        except (
+                            discord.Forbidden, discord.NotFound, discord.HTTPException,
+                            TypeError, ValueError,
+                        ):
+                            await channel.send(msg_text)
+                    else:
+                        await channel.send(msg_text)
+                    sent.append(msg_text)
                     await asyncio.sleep(1.5)
+                except Exception:
+                    if not sent:
+                        raise
+                    print(f"⚠️ 醒后补回复仅发送了 {len(sent)}/{len(msgs)} 段，按已发送内容记忆")
+                    break
+
+            assistant_context = "\n".join(sent)
+            async with state.get_bucket_lock(hist_key):
+                hist = get_history(hist_key)
+                if not any(item.get("source") == wakeup_source for item in hist):
+                    hist.append({
+                        "role": "user", "content": pending_context,
+                        "source": wakeup_source,
+                    })
+                    hist.append({
+                        "role": "assistant", "content": assistant_context,
+                        "source": wakeup_source,
+                    })
+                    state.mark_history_dirty(hist_key)
+            await trim_history(hist_key)
+            if await persist_history_now(hist_key):
+                await _remove_sleep_pending(entries)
+            else:
+                print(f"⚠️ 醒后回复已发送但历史落库失败，保留去重队列: 频道 {ch_id}")
+
+            for role, content in (
+                ("user", pending_context), ("assistant", assistant_context),
+            ):
+                try:
+                    await record_conversation_event(
+                        hist_key, role, content, source="wakeup"
+                    )
+                except Exception as event_exc:
+                    print(f"⚠️ 记录醒后对话事件失败 ({role}): {event_exc}")
 
             print(f"✅ 睡醒补回复: 频道 {ch_id}，{len(entries)} 条待处理")
         except Exception as e:
@@ -1254,12 +1362,10 @@ async def trip_scheduler_check():
 @tasks.loop(minutes=presence_mod.ROTATE_MINUTES)
 async def rotate_presence():
     await discord_client.wait_until_ready()
-    previous = state.current_life_slot or {}
-    slot, changed = await refresh_life_state()
+    slot, _ = await refresh_life_state()
 
-    if previous.get("availability") == "asleep" and slot.get("availability") != "asleep":
-        if state.sleep_pending_messages:
-            state.spawn_bg(_wakeup_catchup(), name="wakeup_catchup")
+    if slot.get("availability") != "asleep" and state.sleep_pending_messages:
+        start_wakeup_catchup()
 
 
 @tasks.loop(minutes=30)

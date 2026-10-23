@@ -15,5 +15,16 @@ intents.presences = True
 intents.typing = True
 intents.polls = True
 
-discord_client = discord.Client(intents=intents)
+class TheodoreClient(discord.Client):
+    async def close(self) -> None:
+        try:
+            from history import flush_dirty_histories
+
+            await flush_dirty_histories()
+        except Exception as exc:
+            print(f"⚠️ 关闭前保存对话历史失败: {exc}")
+        await super().close()
+
+
+discord_client = TheodoreClient(intents=intents)
 slash_tree = app_commands.CommandTree(discord_client)

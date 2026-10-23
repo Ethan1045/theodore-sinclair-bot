@@ -337,7 +337,9 @@ async def on_ready():
     if not tasks_bg.daily_occasion_check.is_running():
         tasks_bg.daily_occasion_check.start()
     try:
-        await refresh_life_state(force_presence=True)
+        slot, _ = await refresh_life_state(force_presence=True)
+        if slot.get("availability") != "asleep" and state.sleep_pending_messages:
+            tasks_bg.start_wakeup_catchup()
     except Exception as e:
         print(f"⚠️ 初始日程状态设置失败: {e}")
     if not tasks_bg.partner_proactive_topic_check.is_running():
@@ -531,8 +533,8 @@ async def on_message(message):
 
     # 睡眠模式：降低回复概率，或改为挂表情
     if is_sleeping and should_send_to_brain:
-        def _track_sleep_pending(drowsy: bool):
-            state.sleep_pending_messages.append({
+        async def _track_sleep_pending(drowsy: bool):
+            await tasks_bg.queue_sleep_pending({
                 "channel_id": message.channel.id,
                 "message_id": message.id,
                 "user_id": message.author.id,
@@ -548,7 +550,7 @@ async def on_message(message):
                 # 深夜被 恋人 叫醒，小概率迷糊回复
                 if random.random() < 0.25:
                     sleep_mode = "drowsy_deep"
-                    _track_sleep_pending(True)
+                    await _track_sleep_pending(True)
                 else:
                     # 挂个表情表示睡着了，睡醒后再自然补回。
                     try:
@@ -556,7 +558,7 @@ async def on_message(message):
                         await message.add_reaction(random.choice(sleepy_emojis))
                     except Exception:
                         pass
-                    _track_sleep_pending(False)
+                    await _track_sleep_pending(False)
                     should_send_to_brain = False
             else:
                 # 深夜其他人：直接不回
@@ -566,13 +568,13 @@ async def on_message(message):
                 # 浅睡被 恋人 叫：较高概率迷糊回
                 if random.random() < 0.55:
                     sleep_mode = "drowsy_light"
-                    _track_sleep_pending(True)
+                    await _track_sleep_pending(True)
                 else:
                     try:
                         await message.add_reaction(random.choice(["💤", "🫠"]))
                     except Exception:
                         pass
-                    _track_sleep_pending(False)
+                    await _track_sleep_pending(False)
                     should_send_to_brain = False
             elif is_mentioned:
                 # 浅睡被 @ ：偶尔回
